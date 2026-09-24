@@ -62,8 +62,10 @@ each call put on the wire — the kwargs with ``extra_body`` merged in, as the S
 Self-test with ``python offline_stub.py --check``; probe a real provider with
 ``python offline_stub.py --live --model <id>`` (add ``--extra-body '{...}'`` for request fields, e.g. the
 ``chat_template_kwargs`` that turns thinking off on a local server). The live probe first asks the server
-what the model advertises — OpenRouter's ``/models`` and ``/models/<id>/endpoints`` cost no quota — then
-spends one call, and reports a quota, credit or key failure as what it is rather than as a jevper failure.
+what the model advertises — OpenRouter's ``/models`` and ``/models/<id>/endpoints`` cost no quota, and a
+local server usually publishes nothing — and then makes one ``system_one`` call, which on a dual-surface
+client can be up to three requests as ``auto`` discovers the readout. A quota, credit or key failure is
+reported as what it is rather than as a jevper failure, on stderr, so stdout is the JSON report or nothing.
 """
 
 from __future__ import annotations
@@ -948,6 +950,22 @@ def _run_checks() -> int:
         check("truncated: a cut-off answer is IncompleteAnswerError naming the budget", False, repr(exc))
     else:  # pragma: no cover
         check("truncated: a cut-off answer is IncompleteAnswerError naming the budget", False, "no error")
+
+    # The same on Chat Completions, where the stop reason is spelled ``length`` rather than
+    # ``max_output_tokens``: the class and the remedy are the surface's own wording, not a new contract.
+    stub = StubClient(scenario="truncated", surface="chat_completions")
+    try:
+        SystemOneClient(stub, model="stub-model", method="structured").system_one(
+            state=state, questions={"intent": question()}
+        )
+    except IncompleteAnswerError as exc:
+        check("truncated: the Chat finish_reason names the same spent budget",
+              "ran out of output tokens" in str(exc) and "'length'" in str(exc)
+              and len(stub.requests) == 1, str(exc))
+    except JevperError as exc:  # pragma: no cover - the wrong error type
+        check("truncated: the Chat finish_reason names the same spent budget", False, repr(exc))
+    else:  # pragma: no cover
+        check("truncated: the Chat finish_reason names the same spent budget", False, "no error")
 
     # Pinning logprobs against that provider is the trap the docs warn about: it raises, spends the one
     # surface move it is allowed, and is never swapped for the structured readout that would have worked.

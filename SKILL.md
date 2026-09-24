@@ -6,8 +6,9 @@ description: Writes and debugs Python code that calls jevper — the Jev (System
 # jevper
 
 `state` in, typed `questions` out. One call sends your text plus `Noul` (yes/no), `Choice` (one of N
-options) or `Score` (ordered level) questions and returns one answer per question, each carrying
-probabilities and a `confidence`. The client is duck-typed — `OpenAI()`, `AsyncOpenAI()`,
+options) or `Score` (ordered level) questions and returns one answer per question — `Choice` and `Score`
+with probabilities and a `confidence`, `Noul` with its single probability.
+The client is duck-typed — `OpenAI()`, `AsyncOpenAI()`,
 `Anthropic()`, or anything exposing `chat.completions.create` / `responses.create` / `messages.create` — so
 hosted models and self-hosted llama.cpp/vLLM/Ollama/SGLang servers work the same way, and the state is
 rendered last so a rubric's prompts share a cacheable prefix. `openai` and `anthropic` are not runtime
@@ -44,9 +45,10 @@ answer.probabilities  # {"billing": 0.88, "technical": 0.08, "sales": 0.03} — 
 answer.confidence     # 0.83
 ```
 
-Each question is its own provider call, and questions run concurrently (`max_concurrency`, default 8):
-put the questions you need into one `system_one` call instead of looping. `state` may be a string, a chat
-message list, `{"messages": [...]}`, or any JSON value (rendered as pretty-printed JSON in one user turn).
+Each question is answered by its own provider call, and questions run concurrently (`max_concurrency`,
+default 8): put the questions you need into one `system_one` call instead of looping. `state` may be a
+string, a chat message list, `{"messages": [...]}`, or any other JSON value (rendered as pretty-printed JSON
+in one user turn; a list of dicts is read as chat turns, a list of anything else as content).
 
 ## Questions
 
@@ -84,10 +86,12 @@ never implemented logprobs.
 
 What `auto` does, so you can rely on it: the verdict is made per `(model, surface)` by observation and
 remembered for the life of the client; a `Choice` with more than 26 options goes straight to JSON. Three
-things count as "this provider cannot do logprobs" — a 4xx that names the logprob fields, an answer with no
-logprobs at all, or an answer token with no alternatives. A rejection that complains only about a *value*
-(a server whose `top_logprobs` cap is lower than 20) still falls back for that question but is not
-remembered, and a 5xx that survives retries falls back for that question alone without moving anything.
+things count as "this provider cannot do logprobs" — a `400`/`403`/`422` that names the logprob fields (any
+other status is not capability evidence, whatever its text says), an answer with no logprobs at all, or an
+answer token with no alternatives. A rejection is remembered at once; a response that merely lacks logprobs
+falls back for that question but is written off only after a second one. A rejection that complains only
+about a *value* (a server whose `top_logprobs` cap is lower than 20) is never remembered, and a 5xx that
+survives retries falls back for that question alone without moving anything.
 The same distinction decides the capability ladder below: a server that refuses the *number* in a field it
 knows — `budget_tokens: must be at least 1024`, `reasoning_effort must be one of low, medium, high` — keeps
 its own error instead of having the field dropped, because answering with your reasoning quietly switched
@@ -99,24 +103,24 @@ mode is not `native`, because a server can implement a route and still not carry
 list, llama.cpp's refuses the fields outright). A pinned `method="logprobs"` takes that same move — it asked
 for a distribution, not for a particular surface to produce one — and keeps its method; with nowhere to
 move it reports the provider's refusal rather than answering in JSON. A `grammar` request never moves: it
-is a Chat Completions convention the other surface cannot carry. `auto` also reads a 404 that does not name
-the model as "no such route" and re-asks on the other surface, but only where the client can speak it — a
-Messages-only client keeps re-asking and keeps reporting the 404. All of these verdicts are remembered.
-Cost: the first question of the first call pays with one extra provider call, and a dual-surface client
-spends up to three requests on it (the surface move, then the method fallback) — requests the provider
-rejected are not counted in `usage.n_calls`.
+is a Chat Completions convention the other surface cannot carry. `auto` also reads a 404 as "no such route"
+— unless it quotes the model id *and* says the model does not exist, which is the model rather than the
+route — and re-asks on the other surface where the client can speak it; a Messages-only client keeps
+re-asking and keeps reporting the 404, with the route remembered. Cost: every question already in flight can
+pay the discovery, and a dual-surface client spends three requests on it (the other surface, then the
+method fallback) — three is the ordinary path, not a cap, since ladder re-asks and transient retries add
+more — while requests the provider rejected are not counted in `usage.n_calls`.
 
 `api="messages"` (an `anthropic.Anthropic` client) is the third surface and the only one with no label
 readout: no logprobs exist in that API, so `auto` answers with `structured` there without spending a call,
 and a pinned `logprobs`/`grammar` raises `UnsupportedMethodError` before any request. Its schema travels as
-Anthropic's own `output_config.format` field, with the JSON Schema also kept in the system prompt — a server
-can accept that field and drop it without a word, and the prompt is the only place the shape is then stated
-(set `temperature=0.0` there); a server that refuses the field has it dropped and the call re-asked.
-`max_tokens` is required and jevper sends `1024` — plus your thinking budget, since this API wants the budget
-strictly *below* `max_tokens` — unless `extra_body={"max_tokens": n}` overrides both. Thinking is a budget here,
-`ReasoningConfig(budget_tokens=n)`, which `mode="auto"` selects on its own on this surface; a server that
-does not know the field at all (SGLang's) has it dropped and the call re-asked, while one that refuses the
-number gets its own error back.
+Anthropic's own `output_config.format` field *and* in the system prompt — a server can accept that field and
+drop it without a word, so the prompt is the only place the shape is then stated (set `temperature=0.0`
+there), and a server that refuses the field has it dropped and the call re-asked. `max_tokens` is required
+and jevper sends `1024` — plus your thinking budget, which this API wants strictly *below* it — unless
+`extra_body={"max_tokens": n}` overrides both. Thinking is a budget here, `ReasoningConfig(budget_tokens=n)`,
+which `mode="auto"` selects on its own; a server that does not know the field (SGLang's) has it dropped and
+the call re-asked, while one that refuses the number gets its own error back.
 
 Know the refusals by sight, and let the probe in
 [Test without spending tokens](#test-without-spending-tokens) settle a new endpoint in one call:
@@ -147,10 +151,10 @@ no rival to read — is answered by every method, `logprobs` included, at probab
 Check what actually happened before debugging blind:
 
 ```python
-response.debug["method"]                                  # what auto resolved to, or what you pinned
-response.debug["methods"]                                 # {"intent": "structured"} — auto only
+response.debug["method"]                                  # the call-level default: what auto starts with, or what you pinned
+response.debug["methods"]                                 # {"intent": "structured"} — what each question resolved to, auto only
 response.debug["api"]                                     # "chat_completions" | "responses" | "messages"
-response.debug["server_limits"]                           # fields the *answer's* surface refused, else absent
+response.debug["server_limits"]                           # six flags for the final surface, absent when it refused nothing
 response.debug["llm_attempts"][-1]["readout"]["source"]   # which readout produced the final answer
 response.usage.n_calls                                    # answered calls: +analysis passes, +corrective retries
 response.usage.cached_tokens                              # what the provider read from its prompt cache
@@ -161,12 +165,13 @@ len(response.debug["llm_attempts"])                       # every provider attem
 
 The prompt is assembled in cache order — system prompt, few-shot turns, question block, state turns — so
 the part that changes between calls, the state, comes last and a rubric's calls share everything before it.
-That is what makes a re-ask with a different state cheap, and what gets a prompt over the 1024-token
-minimum a hosted API caches from. One shape is the exception: a chat-list state whose own last turn is the
+That is what makes a re-ask with a different state cheap, and what gets a prompt over OpenAI's 1024-token
+minimum cacheable prefix. One shape is the exception: a chat-list state whose own last turn is the
 assistant's, which no server reads as a question (the llama.cpp engines answer
 `400 Failed to initialize samplers`), so the question goes last there and that prefix is not reusable.
 
-Every request carries a `prompt_cache_key`: yours if you passed one (`prompt_cache_key=` on the client or
+Every Chat Completions and Responses request carries a `prompt_cache_key` (the Messages API has no such
+field): yours if you passed one (`prompt_cache_key=` on the client or
 the call; a non-blank string of at most 256 characters, else `JevperError` before any request is sent), or
 one derived per question from the model, the method, the example turns and the question block — the method
 belongs in it because its system prompt and answer shape are part of the cached prefix, so a `logprobs`
@@ -189,19 +194,21 @@ Four groups, and only the two middle ones are worth catching for control flow:
 
 | Error | Raised when | What to do |
 | --- | --- | --- |
-| `InvalidQuestionError`, `UnsupportedMethodError`, `ClientCapabilityError` | before any request: bad question or example (every example is checked up front, before the first call), `grammar` on the wrong surface or `logprobs`/`grammar` on the Messages surface, client missing the attribute a surface needs, or a response with no usable first choice and no explanation | fix the code — these cost nothing and never need a retry |
-| `LabelReadoutError`, `MalformedAnswerError` | the answer could not be read; retried once by default (`n_retry_malformed`) with a correction turn | usually leave it alone; `auto` turns the provider-side cases into `structured` instead |
+| `InvalidQuestionError`, `UnsupportedMethodError`, `ClientCapabilityError` | before any request: bad question or example (every example is checked up front, before the first call), `grammar` on the wrong surface or `logprobs`/`grammar` on the Messages surface, or a client missing the attribute a surface needs — plus, after one, a response with no usable first choice and no explanation of why | fix the code; the first three cost nothing, and the last is never retried |
+| `LabelReadoutError`, `MalformedAnswerError` | the answer came back but could not be read; a model-side failure gets one corrective retry by default (`n_retry_malformed`) with a correction turn, while a provider that does not report logprobs at all is never corrected | usually leave it alone; `auto` turns the provider-side cases into `structured` instead |
 | `IncompleteAnswerError`, `ModelRefusalError` | the provider stopped generating before the answer was complete (a spent output budget, or a context window too small) or reported that the model declined — both are `ProviderError` subclasses raised *before* any readout, because a cut-off or declined generation is not an answer to correct | fix the request, not the reader: turn thinking off, raise `extra_body={"max_tokens": ...}` or shorten the state; a refusal needs a different request or model, and a retry is refused the same way |
-| `ProviderError` | a provider call failed after transient retries; `.attempts` and `.status_code` hold the history, including a status carried inside a `200` body (OpenRouter), and it is also what you get when no surface the client can speak has the route — a missing route is the provider's failure, not a verdict jevper keeps | the only one worth a retry loop of your own, and the one to catch at a service boundary |
+| `ProviderError` | a provider call failed — retried while the failure is transient, which is the set below — and `.attempts`/`.status_code` hold the history, including a status carried inside a `200` body (OpenRouter) and a Responses status that is neither `completed` nor `incomplete`. It is also what you get when no surface the client can speak has the route, and that route verdict is remembered, so a client that can speak neither pays the same 404 on every call | the one to catch at a service boundary; retry it yourself only for the transient set — a missing route and a terminal generation will fail again |
 
 `JevperError` is the base class — catch it if you want one handler for everything, including constructor
 misuse (a count option that is not an integer or out of range, a blank `model`, an unknown `method`/`api`), a
 bad `state` message, and content that is not JSON-serializable or carries a non-finite number.
 Transient failures (`408`, `429`, `500`, `502`, `503`, `504`, `529`, connection and timeout errors, httpx
 transport errors) are retried per call with `RetryPolicy(n_retries=2, base_delay=0.5, max_delay=8.0)`, at
-`min(base_delay · 3ⁿ, max_delay)`. A rate-limited provider's own `Retry-After` or `retry-after-ms` header —
-delta-seconds or an HTTP date, in any case — replaces that backoff, uncapped by `max_delay` because the wait
-is the server's to set; `respect_retry_after=False` keeps the curve alone.
+`min(base_delay · 3ⁿ, max_delay)`. A rate-limited provider's own header replaces that backoff instead:
+`Retry-After` as delta-seconds or an HTTP date, `retry-after-ms` as milliseconds. `max_delay` does not cap
+a header jevper honours (short of a 2^53-second bound on what can be slept), because coming back sooner is
+another request the server will refuse; `respect_retry_after=False` keeps the curve alone, and an unreadable
+value falls back to it.
 
 MLflow traces the same story without jevper's help: `mlflow.openai.autolog()` and `mlflow.anthropic.autolog()`
 patch SDK resource classes, so every call through a real OpenAI/Anthropic SDK client — rejected, retried and
@@ -209,25 +216,30 @@ fallback attempts included — is a span, and wrapping the jevper call in `@mlfl
 parent; a duck-typed client is not autologged.
 [references/features.md](references/features.md#tracing-with-mlflow).
 
-A server that refuses a field jevper added for capability does not fail the call: `response_format` (or
-`text.format`) walks `json_schema` → `json_object` → nothing, then the reasoning parameters, then the
-Responses `include` list, then `prompt_cache_key`, then the Messages `output_config` and `thinking` fields.
-Each rung is remembered for that surface, and the question is still answered — with a fresh retry budget,
-since the attempts the old request shape spent say nothing about the new one. `debug["server_limits"]`
-reports the rungs of the surface the *answer* came from, so a refusal on a surface jevper later left is
-narrated in `debug["retry_reasons"]` instead — read both when a ladder step seems to be missing.
-Only a complaint about the field's *existence* moves the ladder: a refusal of the value
-(`budget_tokens: must be at least 1024`) travels back as the provider's own error. A capability field you
-named in `extra_body` is dropped with jevper's own — the SDK merges `extra_body` last, so leaving it there
-would send the refused bytes again — and with `structured_outputs=False` the request already carried a
-plain `json_object`, so that rung is skipped. The ladder is finite, so a server that refuses everything
-still ends in `ProviderError`.
+A server that refuses a field jevper added for capability does not fail the call. The ladder runs
+`include` first (unless the refused entry is the logprob carrier, which is a readout problem, not a
+reasoning one), then the schema — `response_format`/`text.format` walking `json_schema` → `json_object` →
+nothing, or on the Messages surface `output_config.format` dropped whole, since the prompt is where that
+schema lived before the field existed — then `reasoning_effort`/`reasoning`, then `prompt_cache_key`, then
+the Messages `thinking` field. Each rung is remembered for that surface, and the question is still
+answered — with a fresh retry budget, since the attempts the old request shape spent say nothing about the
+new one. `debug["server_limits"]` is a six-field snapshot for the surface the *answer* came from, absent
+when that surface refused nothing; a refusal on a surface jevper later left is in that question's
+`llm_attempts`, not in `retry_reasons` — read both when a ladder step seems to be missing.
+Only a complaint about a field's *existence* moves the ladder, and the schema is the exception: a
+complaint about its *content* moves it too, because the prompt keeps the schema either way. A refusal of the
+number in any other field (`budget_tokens: must be at least 1024`) travels back as the provider's own
+error. A capability field you named in `extra_body` is dropped with jevper's own — the SDK merges
+`extra_body` last, so leaving it there would send the refused bytes again — and with
+`structured_outputs=False` the request already carried a plain `json_object`, so that rung is skipped. The
+ladder is finite, so a server that refuses everything still ends in `ProviderError`.
 
 Three traps worth knowing:
 
-- **One logprob is not a distribution.** A provider that reports only the sampled token gives nothing to
-  compare against: `auto` falls back to `structured`, a pinned `logprobs` raises `LabelReadoutError`. Do not
-  "fix" that by pinning harder — raise `top_logprobs`, or accept the fallback.
+- **One logprob is not a distribution.** A provider that reports only the sampled token gives a question with
+  more than one option nothing to compare against: `auto` falls back to `structured`, a pinned `logprobs`
+  raises `LabelReadoutError` — unless the question has a single option, where the sampled token is the
+  answer. Do not "fix" the general case by pinning harder: raise `top_logprobs`, or accept the fallback.
 - **`structured` probabilities are the model's self-report.** They are rescaled when they miss 1 by more
   than `1e-6`, and the model's original numbers are kept in `debug["original_probabilities"]` (with the
   error in `debug["probability_errors"]`). Set `temperature=0.0` there; sampling noise moves them directly.
@@ -238,13 +250,12 @@ Three traps worth knowing:
   model spending the whole output budget thinking — is `IncompleteAnswerError`, naming the stop reason
   (`finish_reason: 'length'` / `incomplete_details.reason: 'max_output_tokens'` /
   `stop_reason: 'max_tokens'`) and suggesting `extra_body={"max_tokens": ...}`; nobody sends those caps, so
-  raise it and turn thinking off. A context window too small is terminal in the same way but wants the
-  opposite remedy, so that message says to shorten the state or the examples. A model that *refused* is
-  `ModelRefusalError` — a `refusal` beside a null `content`, a `refusal` content part, or
-  `stop_reason: 'refusal'`, with the model's own words where the surface has them. None of the three spends
-  the corrective retry a malformed answer gets. A reasoning parser that swallowed the whole generation into a
-  thinking block *is* a `MalformedAnswerError` ("the response carried reasoning only"): a serving-side
-  setting, not something another retry fixes.
+  raise it and turn thinking off. A context window too small is terminal the same way but wants the opposite
+  remedy, so that message says to shorten the state or the examples. A refusal is `ModelRefusalError` — a
+  `refusal` beside a null `content`, a `refusal` content part, or `stop_reason: 'refusal'`, with the model's
+  own words where the surface has them. None of the three spends a corrective retry; a reasoning parser that
+  swallowed the whole generation into a thinking block *is* a `MalformedAnswerError` ("the response carried
+  reasoning only"), which is a serving-side setting rather than something another retry fixes.
 
 ## Test without spending tokens
 

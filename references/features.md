@@ -226,7 +226,7 @@ token when it sent one with those fields missing — `mlflow.llm.model` the mode
 `anthropic`, and `mlflow.spanLogLevel` `20` for a call that returned, `40` for one that raised, `10` for a
 plain `@mlflow.trace` span of your own. The status follows the *SDK
 call*, not jevper's reading of the answer: a refusal or a spent budget arrives as an HTTP `200`, so the span
-is `OK` while jevper raises `MalformedAnswerError` or `LabelReadoutError` — and a 200 the SDK itself cannot
+is `OK` while jevper raises `ModelRefusalError` or `IncompleteAnswerError` — and a 200 the SDK itself cannot
 parse is an error span, while one it tolerates and jevper then trips over is not. The span says what the
 provider said, the error says whether an answer came out. A duck-typed client of your own is invisible to
 autolog; wrap it in `@mlflow.trace` yourself. `mlflow.tracing.disable()` stops recording, an unwritable
@@ -253,12 +253,12 @@ verified against MLflow 3.16.1, is the library's `docs/mlflow.md`; the extra is
 | `method` | `"auto"` | you have a reason (see SKILL.md) |
 | `api` | `"auto"` (prefers Responses, then Chat Completions, then Messages) | a client exposes several surfaces and you want a specific one |
 | `top_logprobs` | `20` | an integer in `[0, 20]`, enforced locally for every method; lower it only if the provider rejects the field. A pinned `logprobs`/`grammar` needs at least 2, since one logprob is not a distribution. A provider whose cap is lower refuses the *value* (`Invalid 'top_logprobs': integer must be between 0 and 5`), which falls back for that question without writing logprobs off for good |
-| `structured_outputs` | `True` | `False` sends `{"type": "json_object"}` instead of a strict schema, and the schema then travels in the system prompt — for providers that reject strict schemas; a server that refuses the format field outright then skips that rung and is re-asked without one |
-| `prompt_cache_key` | `None` (derived per question) | route one rubric's calls to a shared cache, or keep tenants apart; non-blank, at most 256 characters |
+| `structured_outputs` | `True` | `False` sends `{"type": "json_object"}` instead of a strict schema on Chat Completions and Responses, and the schema then travels in the system prompt — for providers that reject strict schemas; a server that refuses the format field outright then skips that rung and is re-asked without one. The Messages route has no softer shape to send: the field is simply not sent there and the prompt carries the schema either way |
+| `prompt_cache_key` | `None` (derived per question) | route one rubric's calls to a reusable cache; non-blank, at most 256 characters. It is a routing label, not an isolation boundary — for tenants sharing a server use the provider's own control (`extra_body={"cache_salt": ...}`, below) |
 | `normalize_probabilities` | `True` | `False` returns the model's `structured` numbers verbatim — the provider's own values, a mass above 1 included, with the error still recorded in `debug`; a negative or non-finite value is a `MalformedAnswerError` either way. A `Score` is still read off the rescaled distribution, so `score` stays on the 0..N-1 line while the reported probabilities do not |
 | `max_concurrency` | `8` | your provider rate-limits per key |
 | `n_retry_malformed` | `1` | a model that keeps answering in prose |
-| `retry` | `RetryPolicy()` | transient-failure retries: `n_retries=2`, `base_delay=0.5`, `max_delay=8.0`, `respect_retry_after=True` — a `Retry-After`/`retry-after-ms` header (delta-seconds or an HTTP date) replaces the backoff, uncapped by `max_delay`; set it `False` for the curve alone |
+| `retry` | `RetryPolicy()` | transient-failure retries: `n_retries=2`, `base_delay=0.5`, `max_delay=8.0`, `respect_retry_after=True` — a `Retry-After` header (delta-seconds or an HTTP date) or a numeric `retry-after-ms` replaces the backoff, which `max_delay` does not cap; set it `False` for the curve alone |
 | `extra_body`, `extra_headers` | `None` | provider-specific fields — including `max_tokens` on the Messages surface, where jevper's `1024` default may be too small, and the local servers' `chat_template_kwargs` that turns thinking off. A key named here is what reaches the wire (the SDK merges `extra_body` last), so it also wins over jevper's own value for that field; jevper's own copy of a capability field is dropped with it when a server refuses that field |
 
 Constructor misuse (unknown `method`/`api`, a count option that is not an integer, `top_logprobs` outside

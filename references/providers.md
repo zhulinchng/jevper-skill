@@ -37,17 +37,20 @@ python scripts/offline_stub.py --live --model <model-id> --api messages   # Anth
 ```
 
 It prints the resolved method per question, the surface actually used, the readout source, `n_calls`,
-`usage.cached_tokens` and `debug["server_limits"]` for one real call. The `messages` probe needs the
+`usage.cached_tokens` and `debug["server_limits"]` for one real `system_one` call — which on a dual-surface
+client is up to three requests, as `auto` discovers the readout. The `messages` probe needs the
 `anthropic` package and `ANTHROPIC_BASE_URL` (or `OPENAI_BASE_URL`) for a local server.
 
 The probe asks the server what the model advertises *before* spending a call — `GET {base_url}/models`, and
 OpenRouter's per-provider `GET {base_url}/models/<id>/endpoints`, neither of which counts against a request
-quota — and prints `preflight` (logprobs? a strict schema? a plain `json_object`? neither?). A model
-advertising no logprob field is read with `structured`; one advertising no format field also loses the
-schema, and the shape then rests on the prompt alone.
+quota — and prints `preflight` (logprobs? a strict schema? a plain `json_object`? neither?). It is a report,
+not a setting: the call below it is an ordinary `auto` request, and jevper discovers the same facts by
+asking. What the metadata predicts is what `auto` will find — a model advertising no logprob field is read
+with `structured`, one advertising no format field also loses the schema, and the shape then rests on the
+prompt alone.
 
-Local servers publish no such metadata, so the probe prints `preflight: null` against them and spends its one
-call; that is the unknown case, not a failure. What they do need is in the request, and `--extra-body` is how
+The five local servers measured here publish no such metadata, so the probe prints `preflight: null` against
+them; that is the unknown case, not a failure. What they do need is in the request, and `--extra-body` is how
 the probe carries it — against a server whose template thinks, pass
 `--extra-body '{"chat_template_kwargs": {"enable_thinking": false}}'` (vLLM, SGLang, llama.cpp) or
 `--extra-body '{"reasoning_effort": "none"}'` (ollama), or the first token the label readout sees is the
@@ -140,22 +143,24 @@ A local server is the same client with a different `base_url`. Checked on one 12
 without a distribution it re-asks on Chat Completions and remembers the verdict. `api="chat_completions"`
 skips the discovery entirely. All five also answer the Anthropic Messages route, so `auto` has three
 surfaces to choose from on any of them; ollama, llama.cpp, SGLang and LM Studio were exercised through it
-directly, and vLLM answers `200` with a thinking block and **no text** for a Qwen3-4B model — jevper raises
-`IncompleteAnswerError` naming the stop reason, and the cause is the server's template, so use its OpenAI
-surfaces.
+directly, and vLLM answers `200` with a thinking block and **no text** for a Qwen3-4B model — a completed
+response with nothing to read, so jevper raises `MalformedAnswerError` saying the response carried
+reasoning only (a stop reason of `max_tokens` on the same route would be `IncompleteAnswerError` instead).
+The cause is the server's template, so use its OpenAI surfaces.
 
 **Thinking is the one decision you must make.** `logprobs` and `grammar` read a one-token
 answer, and every one of these servers reports logprobs for *every* generated token — with thinking on,
 that is the first token of the reasoning, not the label, and the readout raises `LabelReadoutError`. Turn
 it off for classification work: it costs a whole reasoning pass to choose one letter. Llama.cpp also
 accepts `reasoning_effort: "none"` (its `--jinja` template) and `reasoning_budget: 0`; ollama's native API
-has a per-model `think` setting. `structured` and `discrete` are unaffected by thinking — they read the
-answer text, and the trace lands in `response.reasoning`.
+has a per-model `think` setting. `structured` and `discrete` do not read the reasoning, so thinking cannot
+change *how* they read an answer — the trace lands in `response.reasoning` — but it can still spend the
+whole output budget on the trace and leave nothing to read, which ends the call.
 
 Measured on `qwen3:4b-thinking-2507` through ollama 0.34.3: `extra_body={"reasoning_effort": "none"}` does
 reach the template and does change the answer — to prose (`First …`), which a label readout cannot read, so
 the error names that first token. A thinking model there wants its own `think` setting through ollama's
-native API, or a non-thinking model; a `structured` or `discrete` call is unaffected either way.
+native API, or a non-thinking model.
 
 A label readout also survives thinking when the server separates the trace *and* the token stream ends
 exactly with the answer text: jevper anchors on that tail and reads the answer's own first token. The
@@ -236,9 +241,10 @@ Four protocol facts shape what the client does on this surface:
   translated into one. A server that refuses the *value* (`budget_tokens: must be at least 1024`) keeps its
   own error rather than being re-asked with your reasoning silently switched off; one that does not know the
   field at all has it dropped and the call re-asked, reported in `debug["server_limits"]["thinking"]`.
-- **`temperature` is left out of a Messages request that enables `thinking`** — the API refuses a
-  non-default temperature beside thinking, so jevper omits it there. Set it on the OpenAI surfaces, or turn
-  thinking off, if you were counting on it.
+- **jevper's own `temperature` is left out of a Messages request that enables `thinking`** — the API refuses
+  a non-default temperature beside thinking. A temperature you name in `extra_body` still reaches the
+  request, and the provider may refuse it. Set it on the OpenAI surfaces, or turn thinking off, if you were
+  counting on it.
 - **A `system` role inside `messages` is not part of the API** — Anthropic has since added mid-conversation
   `system` messages, but none of these servers implements them, rendering a `system` turn positionally into
   the chat template instead — so jevper moves it to the top-level `system` field, where it cannot be dropped
