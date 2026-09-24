@@ -133,18 +133,20 @@ the prompt keeps the full schema, where text can say what a constraint says.
 
 `auto` also falls back between the surfaces, and both verdicts are remembered for the client's life:
 
-- A **404 that does not name the model** is a missing route: the call is re-asked on the other surface. A
-  404 that quotes the model (`ollama` and `vLLM` answer a bad model id that way) is about the model and is
-  reported as it stands. An explicit `api="responses"` never falls back. The remembered verdict only ever
-  *skips* a route, and only where the client can speak the other one: a client whose only surface is
-  `messages` stays on it, pays the 404 again, and reports it as a `ProviderError` with `status_code=404` on
-  every call — the same error the call that learned the verdict raised.
-- A **surface that answers without a distribution** is marked and left behind for that model — ollama's
-  Responses route returns an empty logprob list, llama.cpp's refuses the fields, OpenRouter's refuses the
-  logprob includable outright — so later calls start where the distribution is. A distribution arriving later
-  on a marked surface clears the mark. With no surface left to move to, the readout falls back to
-  `structured`; `reasoning="native"` stops the move (native reasoning exists only on Responses), and so does
-  a `grammar` request, which is a Chat Completions convention the other surface cannot carry.
+- A **404 is a missing route** unless it quotes the model id *and* says the model does not exist, which is
+  the model rather than the route — a message that merely repeats the model name is not enough, and `ollama`
+  and `vLLM` answer a bad model id that way. The call is then re-asked on the other surface. An explicit
+  `api="responses"` never falls back. The remembered verdict only ever *skips* a route, and only where the
+  client can speak the other one: a client whose only surface is `messages` stays on it, pays the 404 again,
+  and reports it as a `ProviderError` with `status_code=404` on every call — the same error the call that
+  learned the verdict raised.
+- A **surface that answers without a distribution** falls back for that question and is left behind for that
+  model once a second answer confirms it — ollama's Responses route returns an empty logprob list,
+  llama.cpp's refuses the fields, OpenRouter's refuses the logprob includable outright — so later calls start
+  where the distribution is, and a distribution arriving later on a marked surface clears the mark. With no
+  surface left to move to, the readout falls back to `structured`; `reasoning="native"` stops the move
+  (native reasoning exists only on Responses), and so does a `grammar` request, which is a Chat Completions
+  convention the other surface cannot carry.
 - A **pinned `method="logprobs"` moves too**, keeping its method: it asked for a distribution, not for a
   particular surface to produce one, and the surface that refuses is not the method the caller chose. It is
   never *swapped* for another readout — with nowhere to move, the provider's refusal is reported as a

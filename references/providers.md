@@ -103,16 +103,16 @@ more `MalformedAnswerError`s, set `temperature=0.0`, and keep the criteria descr
 A client object cannot say whether the *server* implements a route — `openai.OpenAI` exposes
 `responses.create` either way — so `auto` reads the responses:
 
-- **404 that does not name the model** → the route is missing: the call is re-asked on the other surface
-  and remembered for the client's life — but only where the client can speak it. A Messages-only client
-  whose host has no `/v1/messages` route keeps re-asking and keeps reporting the 404
-  (`ProviderError`, `status_code=404`) rather than moving to an attribute it does not have. `ollama` and
-  `vLLM` answer a bad model id with a 404 that quotes the model; those are reported as they stand, on
-  either surface.
-- **A surface that answers without a distribution** → marked and left behind for that model: ollama's
-  Responses route returns an empty logprob list, llama.cpp's refuses the fields and OpenRouter's refuses
-  the includable, while Chat Completions on all three carries the full distribution. A distribution
-  arriving later on a marked surface clears the mark.
+- **404 that does not quote the model id together with "model", "no such" or "not exist"** → the route is
+  missing: the call is re-asked on the other surface and remembered for the client's life — but only where
+  the client can speak it. A Messages-only client whose host has no `/v1/messages` route keeps re-asking and
+  keeps reporting the 404 (`ProviderError`, `status_code=404`) rather than moving to an attribute it does not
+  have. `ollama` and `vLLM` answer a bad model id that way; those are reported as they stand, on either
+  surface.
+- **A surface that answers without a distribution** → left behind for that model after a second confirming
+  answer (a refusal is believed at once): ollama's Responses route returns an empty logprob list, llama.cpp's
+  refuses the fields and OpenRouter's refuses the includable, while Chat Completions on all three carries the
+  full distribution. A distribution arriving later on a marked surface clears the mark.
 - **`reasoning="native"` pins the surface**, because native reasoning is the reason to prefer Responses and
   switching would turn it into a two-step pass silently — and so does a `grammar` request, which the other
   surface cannot carry. A pinned `method="logprobs"` does move, keeping its method.
