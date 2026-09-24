@@ -1,16 +1,20 @@
 ---
 name: jevper
-description: Writes and debugs Python code that calls jevper — the Jev (System One) interface that turns a state plus Noul/Choice/Score questions into typed answers with probabilities and confidence, over any OpenAI-compatible model. Use whenever the user mentions jevper, the Jev or System One API, TypeSafe-style classification, or wants an LLM to classify, label, triage or rate text with confidence scores — including choosing between the logprobs, grammar, structured and discrete methods, making it work on reasoning models, Gemini's OpenAI-compatibility endpoint or Claude (which reject logprobs), fixing LabelReadoutError, MalformedAnswerError or ProviderError, wiring in llama.cpp/vLLM/Ollama, adding few-shot examples or reasoning, and testing an integration without spending provider tokens.
+description: Writes and debugs Python code that calls jevper — the Jev (System One) interface that turns a state plus Noul/Choice/Score questions into typed answers with probabilities and confidence, over any OpenAI-compatible model. Use whenever the user mentions jevper, the Jev or System One API, TypeSafe-style classification, or wants an LLM to classify, label, triage or rate text with confidence scores — including choosing between the logprobs, grammar, structured and discrete methods, making it work on reasoning models, Gemini's OpenAI-compatibility endpoint or Claude (which reject logprobs), pointing an anthropic client at a local server with api="messages" or a thinking budget, fixing LabelReadoutError, MalformedAnswerError or ProviderError, cutting cost with prompt caching and prompt_cache_key, wiring in llama.cpp/vLLM/Ollama/SGLang, adding few-shot examples or reasoning, and testing an integration without spending provider tokens.
 ---
 
 # jevper
 
 `state` in, typed `questions` out. One call sends your text plus `Noul` (yes/no), `Choice` (one of N
 options) or `Score` (ordered level) questions and returns one answer per question, each carrying
-probabilities and a `confidence`. The client is duck-typed — `OpenAI()`, `AsyncOpenAI()`, or anything
-exposing `chat.completions.create` / `responses.create` — so hosted models and self-hosted
-llama.cpp/vLLM/Ollama servers work the same way. `openai` is not a runtime dependency; `pydantic>=2.7`
-is. Python 3.10+.
+probabilities and a `confidence`. The client is duck-typed — `OpenAI()`, `AsyncOpenAI()`,
+`Anthropic()`, or anything exposing `chat.completions.create` / `responses.create` / `messages.create` — so
+hosted models and self-hosted llama.cpp/vLLM/Ollama/SGLang servers work the same way, and the state is
+rendered last so a rubric's prompts share a cacheable prefix. `openai` and `anthropic` are not runtime
+dependencies; `pydantic>=2.7` is. Python 3.10+.
+
+Written against jevper 0.5.0; if you are on a newer release, check its `docs/` — the library is the
+authority.
 
 ## Quick start
 
@@ -78,24 +82,41 @@ never implemented logprobs.
 | `discrete` | one option as JSON | one-hot over the choice |
 
 What `auto` does, so you can rely on it: the verdict is made per `(model, surface)` by observation and
-remembered for the life of the client; the first question of the first call pays for it with at most one
-extra provider call (two under `reasoning`); a `Choice` with more than 26 options goes straight to JSON.
-Three things count as "this provider cannot do logprobs" — a 4xx that names the logprob fields, an answer
-with no logprobs at all, or an answer token with no alternatives — and a 5xx that survives retries falls
-back for that question only, without being remembered.
+remembered for the life of the client; a `Choice` with more than 26 options goes straight to JSON. Three
+things count as "this provider cannot do logprobs" — a 4xx that names the logprob fields, an answer with no
+logprobs at all, or an answer token with no alternatives. A rejection that complains only about a *value*
+(a server whose `top_logprobs` cap is lower than 20) still falls back for that question but is not
+remembered, and a 5xx that survives retries falls back for that question alone without moving anything.
 
-| Provider | `logprobs` |
+Before giving up on logprobs, `auto` tries the other surface when the client exposes one and the reasoning
+mode is not `native`, because a server can implement a route and still not carry logprobs through it
+(ollama's `/v1/responses` answers with an empty list, llama.cpp's refuses the fields outright). It also
+reads a 404 that does not name the model as "no such route" and re-asks on the other surface. Both verdicts
+are remembered. Cost: the first question of the first call pays with one extra provider call, and a
+dual-surface client spends up to three requests on it (the surface move, then the method fallback) —
+requests the provider rejected are not counted in `usage.n_calls`.
+
+`api="messages"` (an `anthropic.Anthropic` client) is the third surface and the only one with no label
+readout: no logprobs exist in that API, so `auto` answers with `structured` there without spending a call,
+and a pinned `logprobs`/`grammar` raises `UnsupportedMethodError` before any request. It has no schema field
+either, so the JSON Schema travels in the system prompt (set `temperature=0.0` there); `max_tokens` is
+required and jevper sends `1024` unless `extra_body` overrides it; and thinking is a budget —
+`ReasoningConfig(mode="native", budget_tokens=n)` — where a server without the field (vLLM's) has it dropped
+and the call re-asked.
+
+Know the refusals by sight, and let the probe in
+[Test without spending tokens](#test-without-spending-tokens) settle a new endpoint in one call:
+
+| Refusal | Where |
 | --- | --- |
-| OpenAI `gpt-4o`, `gpt-4.1` | yes |
-| OpenAI reasoning models (`o`-series, `gpt-5` family) | no — `400 logprobs are not supported with reasoning models.` |
-| OpenAI Responses surface | partial — needs `include`; some models fail outright on `top_logprobs >= 2` |
-| Anthropic Claude | no logprob API at all |
-| Gemini via the OpenAI-compatibility endpoint | no — `400 Unknown name "logprobs": Cannot find field.` |
-| DeepSeek, Together | yes, `top_logprobs` up to 20 |
-| Ollama, llama.cpp, vLLM | yes |
-| anything else | unknown — reasoning models and thin compatibility layers are the ones that say no |
+| `400 logprobs are not supported with reasoning models.` | OpenAI `o`-series and `gpt-5` family |
+| `400 Unknown name "logprobs": Cannot find field.` | Gemini's OpenAI-compatibility endpoint |
+| no logprob API at all | Anthropic Claude, and every server's Messages route |
+| sampled token with no alternatives | OpenAI's Responses surface; OpenRouter routes by price and may drop the field |
 
-With `auto` you do not have to know this table; pin `method` only for a stated reason:
+Full matrix, surfaces and local-server details: [references/providers.md](references/providers.md).
+
+With `auto` you do not have to know any of it; pin `method` only for a stated reason:
 
 - `grammar` — a self-hosted Chat Completions server that accepts a `grammar` field (llama.cpp and friends).
   It is rejected on the Responses surface, and most hosted providers ignore or refuse the field.
@@ -113,11 +134,35 @@ Check what actually happened before debugging blind:
 ```python
 response.debug["method"]                                  # what auto resolved to, or what you pinned
 response.debug["methods"]                                 # {"intent": "structured"} — auto only
-response.debug["api"]                                     # "chat_completions" | "responses"
+response.debug["api"]                                     # "chat_completions" | "responses" | "messages"
+response.debug["server_limits"]                           # fields the server refused, once it has refused any
 response.debug["llm_attempts"][-1]["readout"]["source"]   # which readout produced the final answer
 response.usage.n_calls                                    # answered calls: +analysis passes, +corrective retries
+response.usage.cached_tokens                              # what the provider read from its prompt cache
 len(response.debug["llm_attempts"])                       # every provider attempt, including rejected ones
 ```
+
+## Prompt caching
+
+The prompt is assembled in cache order — system prompt, few-shot turns, question block, state turns — so
+the part that changes between calls, the state, comes last and a rubric's calls share everything before it.
+That is what makes a re-ask with a different state cheap, and what gets a prompt over the 1024-token
+minimum a hosted API caches from.
+
+Every request carries a `prompt_cache_key`: yours if you passed one (`prompt_cache_key=` on the client or
+the call; a non-blank string of at most 256 characters, else `JevperError` before any request is sent), or
+one derived per question from the model, the example turns and the question block. The state is not part of
+it, so one rubric's calls route to the same cache, and both passes of a two-step call share one key.
+
+`usage.cached_tokens` is what the provider read from its cache, `None` when it said nothing, and `0` for a
+cold or disabled one: vLLM reports it only with `--enable-prompt-tokens-details`, SGLang's Chat route only
+with `--enable-cache-report`, and llama.cpp/ollama always. A server that refuses the field has it dropped
+and the call re-asked, reported in `debug["server_limits"]["cache_key"]`. Each surface reports it under its
+own name (`prompt_tokens_details`, `input_tokens_details`, or Anthropic's `cache_read_input_tokens`), and
+jevper reads all three into `usage.cached_tokens`.
+
+Per-server reporting, the measured reuse, and isolating a cache with `extra_body={"cache_salt": ...}`:
+[references/providers.md](references/providers.md).
 
 ## Failures
 
@@ -125,15 +170,23 @@ Three groups, and only the middle one is worth catching for control flow:
 
 | Error | Raised when | What to do |
 | --- | --- | --- |
-| `InvalidQuestionError`, `UnsupportedMethodError`, `ClientCapabilityError` | before any request: bad question or example, `grammar` on the wrong surface, client missing the attribute a surface needs | fix the code — these cost nothing and never need a retry |
+| `InvalidQuestionError`, `UnsupportedMethodError`, `ClientCapabilityError` | before any request: bad question or example, `grammar` on the wrong surface or `logprobs`/`grammar` on the Messages surface, client missing the attribute a surface needs, or a response with no choices and no explanation | fix the code — these cost nothing and never need a retry |
 | `LabelReadoutError`, `MalformedAnswerError` | the answer could not be read; retried once by default (`n_retry_malformed`) with a correction turn | usually leave it alone; `auto` turns the provider-side cases into `structured` instead |
-| `ProviderError` | a provider call failed after transient retries; `.attempts` holds the history | the only one worth a retry loop of your own, and the one to catch at a service boundary |
+| `ProviderError` | a provider call failed after transient retries; `.attempts` and `.status_code` hold the history, including a status carried inside a `200` body (OpenRouter) | the only one worth a retry loop of your own, and the one to catch at a service boundary |
 
-`JevperError` is the base class — catch it if you want one handler for everything. Transient failures
-(`429`, `500`, `502`, `503`, `504`, `529`, connection and timeout errors) are retried per call with
-`RetryPolicy(n_retries=2, base_delay=0.5, max_delay=8.0)`.
+`JevperError` is the base class — catch it if you want one handler for everything, including constructor
+misuse, a bad `state` message, and content that is not JSON-serializable or carries a non-finite number.
+Transient failures (`408`, `429`, `500`, `502`, `503`, `504`, `529`, connection and timeout errors, httpx
+transport errors) are retried per call with `RetryPolicy(n_retries=2, base_delay=0.5, max_delay=8.0)`, at
+`min(base_delay · 3ⁿ, max_delay)`; a `Retry-After` header is not read.
 
-Two traps worth knowing:
+A server that refuses a field jevper added for capability does not fail the call: `response_format` (or
+`text.format`) walks `json_schema` → `json_object` → nothing, then the reasoning parameters, then the
+Responses `include` list, then `prompt_cache_key`, then the Messages `thinking` field. Each rung is
+remembered for that surface and reported in `debug["server_limits"]`, and the question is still answered.
+The ladder is finite, so a server that refuses everything still ends in `ProviderError`.
+
+Three traps worth knowing:
 
 - **One logprob is not a distribution.** A provider that reports only the sampled token gives nothing to
   compare against: `auto` falls back to `structured`, a pinned `logprobs` raises `LabelReadoutError`. Do not
@@ -141,11 +194,20 @@ Two traps worth knowing:
 - **`structured` probabilities are the model's self-report.** They are rescaled when they miss 1 by more
   than `1e-6`, and the model's original numbers are kept in `debug["original_probabilities"]` (with the
   error in `debug["probability_errors"]`). Set `temperature=0.0` there; sampling noise moves them directly.
+- **An answer that never arrived says why.** A reasoning model can spend the whole output budget thinking,
+  and the error text then names the stop reason (`finish_reason: 'length'` /
+  `incomplete_details.reason: 'max_output_tokens'`) and suggests `extra_body={"max_tokens": ...}` — nobody
+  sends those caps, so raise it and turn thinking off too. When a reasoning parser swallowed the whole
+  generation into a thinking block and returned no answer text, the same error says the response carried
+  reasoning only: a server-side deployment setting, not something another retry fixes.
 
 ## Test without spending tokens
 
-`scripts/offline_stub.py` is a duck-typed client that answers from canned bodies — no HTTP, no key, and
-the real readout path (logprobs softmax, structured JSON, `auto`'s fallback) runs end to end.
+`scripts/offline_stub.py` is a duck-typed client that answers from canned bodies — no HTTP, no key — while
+the real readout path (logprobs softmax, structured JSON, `auto`'s fallback and surface move, the
+server-limits ladder, the schema that travels in the prompt when the request cannot carry one) runs end to
+end. Its `surface=` knob picks which endpoints the fake client exposes: `chat_completions`, `responses`,
+`messages` (the Anthropic shape) or `both`.
 
 ```python
 import sys
@@ -161,10 +223,12 @@ assert response.debug["methods"]["intent"] == "structured"   # auto fell back
 assert stub.requests[0]["logprobs"] is True                  # and it did ask for logprobs first
 ```
 
-Scenarios: `logprobs`, `structured`, `reject_logprobs`, `no_alternatives`, `reasoning`. Run
+Scenarios: `logprobs`, `structured`, `reject_logprobs`, `no_alternatives`, `no_responses_route`,
+`reject_schema`, `reject_cache_key`, `reject_thinking`, `truncated`, `reasoning`, `reasoning_only`. Run
 `python scripts/offline_stub.py --check` from the skill directory for a self-test, and
-`python scripts/offline_stub.py --live --model <id>` with real credentials to see which method that
-provider actually resolves to before writing a line of your own.
+`python scripts/offline_stub.py --live --model <id>` (add `--api messages` for an Anthropic-compatible
+server) with real credentials to see which method that provider actually resolves to, on which surface,
+before writing a line of your own.
 
 ## Checklist
 
@@ -173,12 +237,15 @@ provider actually resolves to before writing a line of your own.
 - [ ] Answers read through the typed views (`response.answers[...]`, `.choices`, `.model_dump_json()`).
 - [ ] `JevperError` (or `ProviderError`) caught at the boundary the caller actually cares about.
 - [ ] Verified against the stub before spending provider tokens.
-- [ ] After the first live call: `debug["methods"]` and `usage.n_calls` checked.
+- [ ] After the first live call: `debug["methods"]`, `debug["server_limits"]`, `usage.n_calls` and
+      `usage.cached_tokens` checked.
 
 ## More
 
 - [references/features.md](references/features.md) — reasoning, few-shot examples, async, surfaces, knobs.
-- [references/troubleshooting.md](references/troubleshooting.md) — provider matrix, error triage, debug recipes.
+- [references/providers.md](references/providers.md) — logprob matrix, the Messages route, local servers, cache reporting.
+- [references/troubleshooting.md](references/troubleshooting.md) — error triage, debug keys, symptom → fix.
 
 Inside the jevper repo, `docs/` holds the full reference (`api.md`, `methods.md`, `reasoning.md`,
-`few-shot.md`) and `tests/` drives a real `openai` client against a stub HTTP server.
+`few-shot.md`, `local-servers.md`, `internals.md`) and `tests/` drives a real `openai` client against a
+stub HTTP server.

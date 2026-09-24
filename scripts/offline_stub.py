@@ -1,8 +1,9 @@
-"""An offline stand-in for an OpenAI-compatible client, for jevper code.
+"""An offline stand-in for an OpenAI- or Anthropic-compatible client, for jevper code.
 
 Why: jevper is duck-typed, so a plain object is enough to drive it end to end — no HTTP, no API key, no
-tokens spent — while the real readout path (logprobs softmax, structured JSON, ``auto``'s fallback) runs
-for real.
+tokens spent — while the real readout path (logprobs softmax, structured JSON, ``auto``'s fallback and
+surface move, the server-limits ladder, the schema that travels in the prompt when the request cannot
+carry one) runs for real.
 
     from offline_stub import StubClient
     from jevper import Choice, SystemOneClient
@@ -16,16 +17,27 @@ for real.
 
 Scenarios:
 
-    logprobs          a provider that returns a real next-token distribution
-    structured        a provider that answers in JSON with its own probabilities
-    reject_logprobs   a provider that answers 400 to the logprob fields (OpenAI reasoning models,
-                      Gemini's OpenAI-compatibility layer)
-    no_alternatives   a provider that reports the sampled token and nothing else
-    reasoning         a chat-surface two-step sequence: analysis text, then the answer
+    logprobs             a provider that returns a real next-token distribution
+    structured           a provider that answers in JSON with its own probabilities
+    reject_logprobs      a provider that answers 400 to the logprob fields (OpenAI reasoning models,
+                         Gemini's OpenAI-compatibility layer)
+    no_alternatives      a provider that reports the sampled token and nothing else
+    no_responses_route   a server that answers 404 for /v1/responses — a missing route, not a bad model
+    reject_schema        a server that answers 400 to a strict JSON schema, and accepts ``json_object``
+    reject_cache_key     a server that answers 400 to ``prompt_cache_key``
+    reject_thinking      a server whose protocol has no Messages ``thinking`` field (vLLM's route)
+    truncated            a reasoning model that spent the whole output budget thinking: no answer, and a
+                         stop reason that says so
+    reasoning            a chat-surface two-step sequence: analysis text, then the answer
+    reasoning_only       a server whose reasoning parser put the whole generation in a thinking block:
+                         no answer text at all
 
-Knobs: ``surface`` (``chat_completions``, ``responses`` or ``both``, default ``both``, mirroring the
-OpenAI SDK client), ``winner`` (index into the label alphabet of the option the stub prefers) and
-``alternatives`` (labels reported alongside the answer; 1 means "no distribution").
+Knobs: ``surface`` (``chat_completions``, ``responses``, ``messages`` or ``both``, default ``both`` — the
+endpoints this client exposes, as ``openai.OpenAI`` exposes the first two and ``anthropic.Anthropic`` the
+third), ``winner`` (index into the label alphabet of the option the stub prefers), ``alternatives`` (labels
+reported alongside the answer; 1 means "no distribution") and ``cached_tokens`` (what the server reports as
+read from its prompt cache; ``None`` models a server that says nothing about it). ``requests`` records the
+kwargs of every call and ``surfaces`` the endpoint each one went to, in the same order.
 
 Self-test with ``python offline_stub.py --check``; probe a real provider with
 ``python offline_stub.py --live --model <id>``.
@@ -38,21 +50,40 @@ import json
 import os
 from typing import Any
 
-SCENARIOS = ("logprobs", "structured", "reject_logprobs", "no_alternatives", "reasoning")
-SURFACES = ("chat_completions", "responses", "both")
+SCENARIOS = (
+    "logprobs",
+    "structured",
+    "reject_logprobs",
+    "no_alternatives",
+    "no_responses_route",
+    "reject_schema",
+    "reject_cache_key",
+    "reject_thinking",
+    "truncated",
+    "reasoning",
+    "reasoning_only",
+)
+SURFACES = ("chat_completions", "responses", "messages", "both")
 
 LABELS = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")  # jevper's single-letter label alphabet
 ANSWER_LOGPROB = -0.1  # the sampled label; alternatives trail it, so the softmax is decisive
 ANALYSIS = "The message is about a duplicate charge, so it concerns money."
+TRACE = "The user says they were charged twice, so this is about money."
+SIGNATURE = "sig-stub"  # what an Anthropic thinking block carries for a later replay
+SCHEMA_MARKER = "JSON Schema:\n"  # jevper puts the schema in the prompt when the request cannot carry it
+PROMPT_TOKENS = 2388  # the measured prompt in jevper's docs/local-servers.md
+COMPLETION_TOKENS = 8
+CACHED_TOKENS = 1010  # llama.cpp's reuse for a state-varied second call on that prompt
 
 
 class Rejection(Exception):
-    """The 400 an OpenAI-compatible provider returns when it cannot do logprobs."""
+    """A refusal jevper classifies instead of retrying: a capability 400, or a 404 for a whole route."""
 
-    status_code = 400  # jevper reads this to tell a capability verdict from a transient failure
-
-    def __init__(self, message: str = "logprobs are not supported with reasoning models.") -> None:
+    def __init__(
+        self, message: str = "logprobs are not supported with reasoning models.", status_code: int = 400
+    ) -> None:
         super().__init__(message)
+        self.status_code = status_code
 
 
 def _wants_logprobs(kwargs: dict[str, Any]) -> bool:
@@ -69,6 +100,38 @@ def _requested_schema(kwargs: dict[str, Any]) -> dict[str, Any] | None:
         fmt = text.get("format") or {}
         if fmt.get("type") == "json_schema":
             return fmt.get("schema")
+    return None
+
+
+def _prompt_schema(kwargs: dict[str, Any]) -> dict[str, Any] | None:
+    """The schema jevper put in the prompt, when the request could not carry one itself.
+
+    Both OpenAI surfaces carry a strict schema in the request where the server accepts it; the Messages
+    API has no schema field at all, and a server that refuses the strict schema is re-asked with a plain
+    JSON object — in all three cases jevper states the shape in the system prompt instead. A model reads
+    it there, so the stub does too: without this a request whose schema is only in the prompt would look
+    unanswerable.
+    """
+    texts: list[str] = []
+    system = kwargs.get("system")
+    if isinstance(system, str):
+        texts.append(system)
+    for key in ("messages", "input"):
+        for message in kwargs.get(key) or ():
+            if isinstance(message, dict) and message.get("role") == "system":
+                content = message.get("content")
+                if isinstance(content, str):
+                    texts.append(content)
+    for text in texts:
+        _, marker, rest = text.partition(SCHEMA_MARKER)
+        if not marker:
+            continue
+        try:
+            schema = json.loads(rest)
+        except ValueError:
+            continue
+        if isinstance(schema, dict):
+            return schema
     return None
 
 
@@ -96,20 +159,29 @@ def _schema_answer(schema: dict[str, Any], winner: int) -> dict[str, Any] | None
     return None
 
 
-def _usage(kwargs: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "prompt_tokens": 42,
-        "completion_tokens": 7,
+def _usage(cached: int | None = None) -> dict[str, Any]:
+    """OpenAI-shaped usage, on both the Chat and the Responses key names.
+
+    ``cached`` is what the server reports as read from its prompt cache; a server that reports nothing
+    omits both detail objects, which is how ``usage.cached_tokens`` comes back ``None``.
+    """
+    usage: dict[str, Any] = {
+        "prompt_tokens": PROMPT_TOKENS,
+        "completion_tokens": COMPLETION_TOKENS,
         "completion_tokens_details": {"reasoning_tokens": 0},
-        "input_tokens": 42,
-        "output_tokens": 7,
+        "input_tokens": PROMPT_TOKENS,
+        "output_tokens": COMPLETION_TOKENS,
         "output_tokens_details": {"reasoning_tokens": 0},
     }
+    if cached is not None:
+        usage["prompt_tokens_details"] = {"cached_tokens": cached}
+        usage["input_tokens_details"] = {"cached_tokens": cached}
+    return usage
 
 
 def _chat_body(
     kwargs: dict[str, Any], *, text: str | None = None, body: dict[str, Any] | None = None,
-    entries: list[dict[str, Any]] | None = None,
+    entries: list[dict[str, Any]] | None = None, stop: str | None = None, cached: int | None = None,
 ) -> dict[str, Any]:
     if body is not None:
         content = json.dumps(body)
@@ -122,18 +194,20 @@ def _chat_body(
     choice: dict[str, Any] = {
         "index": 0,
         "message": {"role": "assistant", "content": content},
-        "finish_reason": "stop",
+        "finish_reason": stop or "stop",  # "length": the output budget ran out mid-answer
     }
     if entries is not None:
         # An empty list is a provider that ignores the logprob fields: `logprobs: null`, as sent back
         # by compatibility layers that drop the field.
         choice["logprobs"] = {"content": entries} if entries else None
-    return {"id": "stub-chat", "model": kwargs.get("model"), "choices": [choice], "usage": _usage(kwargs)}
+    return {
+        "id": "stub-chat", "model": kwargs.get("model"), "choices": [choice], "usage": _usage(cached)
+    }
 
 
 def _responses_body(
     kwargs: dict[str, Any], *, text: str | None = None, body: dict[str, Any] | None = None,
-    entries: list[dict[str, Any]] | None = None,
+    entries: list[dict[str, Any]] | None = None, stop: str | None = None, cached: int | None = None,
 ) -> dict[str, Any]:
     if body is not None:
         content = json.dumps(body)
@@ -146,15 +220,57 @@ def _responses_body(
     part: dict[str, Any] = {"type": "output_text", "text": content, "annotations": []}
     if entries:
         part["logprobs"] = entries
-    return {
+    payload: dict[str, Any] = {
         "id": "stub-response",
         "model": kwargs.get("model"),
+        "status": "incomplete" if stop else "completed",
         "output": [
-            {"id": "msg_stub", "type": "message", "role": "assistant", "status": "completed",
-             "content": [part]}
+            {"id": "msg_stub", "type": "message", "role": "assistant",
+             "status": "incomplete" if stop else "completed", "content": [part]}
         ],
         "output_text": content,
-        "usage": _usage(kwargs),
+        "usage": _usage(cached),
+    }
+    if stop:
+        # This surface reports an early end here rather than in a finish_reason.
+        payload["incomplete_details"] = {"reason": "max_output_tokens" if stop == "length" else stop}
+    return payload
+
+
+def _messages_body(
+    kwargs: dict[str, Any], *, text: str | None = None, body: dict[str, Any] | None = None,
+    thinking: str | None = None, stop: str | None = None, cached: int | None = None,
+) -> dict[str, Any]:
+    """An Anthropic ``message``: content blocks, and the answer among them rather than beside them.
+
+    A model that was asked to think answers with a thinking block first, as the real ones do, so a request
+    carrying ``thinking`` gets one. ``text=None`` with ``thinking`` set models a reasoning parser that put
+    the whole generation in the thinking block and returned no text at all.
+    """
+    content: list[dict[str, Any]] = []
+    if thinking is None and kwargs.get("thinking") is not None:
+        thinking = TRACE  # asked to think, the model answers with a thinking block first
+    if thinking:
+        content.append({"type": "thinking", "thinking": thinking, "signature": SIGNATURE})
+    if body is not None:
+        content.append({"type": "text", "text": json.dumps(body)})
+    elif text is not None:
+        content.append({"type": "text", "text": text})
+    usage: dict[str, Any] = {"input_tokens": PROMPT_TOKENS, "output_tokens": COMPLETION_TOKENS}
+    if thinking:
+        usage["output_tokens_details"] = {"thinking_tokens": 12}
+    if cached is not None:
+        # Anthropic's own name for what it read from its prompt cache.
+        usage["cache_read_input_tokens"] = cached
+    return {
+        "id": "stub-message",
+        "type": "message",
+        "role": "assistant",
+        "model": kwargs.get("model"),
+        "content": content,
+        "stop_reason": stop or "end_turn",
+        "stop_sequence": None,
+        "usage": usage,
     }
 
 
@@ -184,6 +300,7 @@ class StubClient:
         surface: str = "both",
         winner: int = 0,
         alternatives: int | None = None,
+        cached_tokens: int | None = CACHED_TOKENS,
     ) -> None:
         if scenario not in SCENARIOS:
             raise ValueError(f"scenario must be one of {SCENARIOS}, got {scenario!r}")
@@ -193,10 +310,16 @@ class StubClient:
         self.surface = surface
         self.winner = winner
         self.alternatives = alternatives
+        self.cached_tokens = cached_tokens
         self.requests: list[dict[str, Any]] = []
-        self.chat = _Namespace(completions=_Endpoint(self, "chat_completions"))
+        self.surfaces: list[str] = []
+        if surface in ("chat_completions", "both"):
+            self.chat = _Namespace(completions=_Endpoint(self, "chat_completions"))
         if surface in ("responses", "both"):
             self.responses = _Endpoint(self, "responses")
+        if surface == "messages":
+            # What ``anthropic.Anthropic`` exposes, and nothing else: this client has no logprob surface.
+            self.messages = _Endpoint(self, "messages")
 
     # -- internals ---------------------------------------------------------------------------------
 
@@ -215,26 +338,53 @@ class StubClient:
 
     def reply(self, kwargs: dict[str, Any], surface: str) -> dict[str, Any]:
         self.requests.append(kwargs)
-        body = _chat_body if surface == "chat_completions" else _responses_body
+        self.surfaces.append(surface)
 
+        if self.scenario == "no_responses_route" and surface == "responses":
+            # A server that never implemented the route: a 404 that says nothing about the model.
+            raise Rejection("Not Found", status_code=404)
+
+        schema = _requested_schema(kwargs) or _prompt_schema(kwargs)
+        if self.scenario == "reject_schema" and _requested_schema(kwargs) is not None:
+            raise Rejection("response_format is not supported by this server.")
+        if self.scenario == "reject_cache_key" and kwargs.get("prompt_cache_key") is not None:
+            raise Rejection("prompt_cache_key is not supported by this server.")
+        if self.scenario == "reject_thinking" and kwargs.get("thinking") is not None:
+            # vLLM's protocol has no ``thinking`` field: the request is refused, and jevper drops it.
+            raise Rejection("thinking is not supported by this server.")
         if self.scenario == "reject_logprobs" and _wants_logprobs(kwargs):
             raise Rejection()
 
-        schema = _requested_schema(kwargs)
+        body = {
+            "chat_completions": _chat_body,
+            "responses": _responses_body,
+            "messages": _messages_body,
+        }[surface]
+
+        if self.scenario == "truncated":
+            # Generation stopped before an answer existed — the stop reason is the actionable fact.
+            return body(kwargs, text="", stop="length", cached=self.cached_tokens)
+
+        if self.scenario == "reasoning_only":
+            # The reasoning parser classified the whole generation as thinking: no text block to read.
+            return _messages_body(kwargs, thinking=TRACE, cached=self.cached_tokens)
+
         if self.scenario == "reasoning" and schema is None and not _wants_logprobs(kwargs):
-            return body(kwargs, text=ANALYSIS)  # the analysis pass: plain text, no schema, no logprobs
+            return body(kwargs, text=ANALYSIS, cached=self.cached_tokens)  # the analysis pass
 
         if _wants_logprobs(kwargs):
             if self.scenario == "no_alternatives":
-                return body(kwargs, entries=self._entries(kwargs, alternatives=1))
-            if self.scenario in ("logprobs", "reasoning"):
-                return body(kwargs, entries=self._entries(kwargs))
-            return body(kwargs, entries=[])  # this provider has no logprobs to give back
+                return body(
+                    kwargs, entries=self._entries(kwargs, alternatives=1), cached=self.cached_tokens
+                )
+            if self.scenario in ("logprobs", "reasoning", "no_responses_route"):
+                return body(kwargs, entries=self._entries(kwargs), cached=self.cached_tokens)
+            return body(kwargs, entries=[], cached=self.cached_tokens)  # no logprobs to give back
 
-        answer = _schema_answer(schema, self.winner) if schema else None
+        answer = _schema_answer(schema, self.winner) if schema is not None else None
         if answer is not None:
-            return body(kwargs, body=answer)
-        return body(kwargs, text="A")  # a request jevper does not read an answer out of
+            return body(kwargs, body=answer, cached=self.cached_tokens)
+        return body(kwargs, text="A", cached=self.cached_tokens)  # a request jevper reads no answer out of
 
 
 # -- self-test ---------------------------------------------------------------------------------------
@@ -245,8 +395,10 @@ def _run_checks() -> int:
         Choice,
         JevperError,
         LabelReadoutError,
+        MalformedAnswerError,
         ReasoningConfig,
         SystemOneClient,
+        UnsupportedMethodError,
         reasoning_text,
     )
 
@@ -294,7 +446,7 @@ def _run_checks() -> int:
     check("structured: no normalization warning on a clean answer",
           response.debug["probability_errors"] == {}, str(response.debug["probability_errors"]))
 
-    # A provider that rejects the logprob fields: auto falls back, and remembers.
+    # A provider that rejects the logprob fields on both surfaces: auto falls back, and remembers.
     stub = StubClient(scenario="reject_logprobs")
     client = SystemOneClient(stub, model="stub-model")
     response = client.system_one(state=state, questions={"intent": question()})
@@ -303,9 +455,16 @@ def _run_checks() -> int:
     check("reject_logprobs: it asked for logprobs first", stub.requests[0].get("top_logprobs") is not None,
           str(stub.requests[0]))
     check("reject_logprobs: the fallback is recorded", bool(response.debug["retry_reasons"]))
-    check("reject_logprobs: the provider saw two requests, one of them rejected",
-          len(stub.requests) == 2 and len(response.debug["llm_attempts"]) == 2,
+    check("reject_logprobs: the surface move is tried first",
+          any("retrying the label readout on api='chat_completions'" in reason
+              for reason in response.debug["retry_reasons"]), str(response.debug["retry_reasons"]))
+    check("reject_logprobs: three requests, two of them rejected",
+          len(stub.requests) == 3 and len(response.debug["llm_attempts"]) == 3,
           f"requests={len(stub.requests)} attempts={len(response.debug['llm_attempts'])}")
+    check("reject_logprobs: responses refused, chat answered",
+          stub.surfaces == ["responses", "chat_completions", "chat_completions"]
+          and response.debug["api"] == "chat_completions",
+          f"surfaces={stub.surfaces} api={response.debug['api']}")
     check("reject_logprobs: a rejected call is not counted as a call",
           response.usage.n_calls == 1, str(response.usage.n_calls))
     before = len(stub.requests)
@@ -314,14 +473,136 @@ def _run_checks() -> int:
           len(stub.requests) == before + 1 and stub.requests[-1].get("logprobs") is None,
           str(stub.requests[-1]))
 
+    # A single-surface client cannot move: the fallback is the method, and the counts drop.
+    stub = StubClient(scenario="reject_logprobs", surface="chat_completions")
+    response = SystemOneClient(stub, model="stub-model").system_one(state=state, questions={"intent": question()})
+    check("reject_logprobs: one surface means two requests and no move",
+          len(stub.requests) == 2 and response.usage.n_calls == 1
+          and response.debug["methods"]["intent"] == "structured",
+          f"requests={len(stub.requests)} n_calls={response.usage.n_calls}")
+
     # A provider that reports the sampled token and nothing else: no distribution to read.
     stub = StubClient(scenario="no_alternatives")
     response = SystemOneClient(stub, model="stub-model").system_one(state=state, questions={"intent": question()})
     check("no_alternatives: auto falls back to structured",
           response.debug["methods"]["intent"] == "structured", str(response.debug["methods"]))
-    check("no_alternatives: two provider calls, both answered",
+    check("no_alternatives: three answered requests, every one counted",
+          len(stub.requests) == 3 and response.usage.n_calls == 3,
+          f"requests={len(stub.requests)} n_calls={response.usage.n_calls}")
+
+    stub = StubClient(scenario="no_alternatives", surface="chat_completions")
+    response = SystemOneClient(stub, model="stub-model").system_one(state=state, questions={"intent": question()})
+    check("no_alternatives: one surface means two answered requests",
           len(stub.requests) == 2 and response.usage.n_calls == 2,
           f"requests={len(stub.requests)} n_calls={response.usage.n_calls}")
+
+    # A server with no Responses route: auto re-asks on Chat Completions and remembers the route.
+    stub = StubClient(scenario="no_responses_route")
+    client = SystemOneClient(stub, model="stub-model")
+    response = client.system_one(state=state, questions={"intent": question()})
+    check("no_responses_route: auto re-asks on chat_completions",
+          response.debug["api"] == "chat_completions" and response.usage.n_calls == 1
+          and stub.surfaces == ["responses", "chat_completions"],
+          f"api={response.debug['api']} n_calls={response.usage.n_calls} surfaces={stub.surfaces}")
+    check("no_responses_route: the readout is unharmed by the move",
+          response.debug["methods"]["intent"] == "logprobs"
+          and response.answers["intent"].choice == "billing",
+          str(response.debug["methods"]))
+    before = len(stub.requests)
+    client.system_one(state=state, questions={"intent": question()})
+    check("no_responses_route: the missing route is remembered",
+          len(stub.requests) == before + 1 and stub.surfaces[-1] == "chat_completions",
+          str(stub.surfaces[-2:]))
+
+    # A server that refuses a strict schema: the ladder drops to `json_object` and answers anyway.
+    stub = StubClient(scenario="reject_schema")
+    response = SystemOneClient(stub, model="stub-model", method="structured").system_one(
+        state=state, questions={"intent": question()}
+    )
+    check("reject_schema: the schema is dropped and the call re-asked",
+          len(stub.requests) == 2 and response.usage.n_calls == 1
+          and ((stub.requests[1].get("text") or {}).get("format") or {}).get("type") == "json_object",
+          f"requests={len(stub.requests)} n_calls={response.usage.n_calls}")
+    check("reject_schema: the server's limit is reported",
+          response.debug["server_limits"]["structured"] == "object",
+          str(response.debug.get("server_limits")))
+    check("reject_schema: the answer still arrives",
+          response.answers["intent"].choice == "billing", repr(response.answers["intent"].choice))
+
+    # A server that refuses the cache key: optional field, dropped, and every later call leaves it out.
+    stub = StubClient(scenario="reject_cache_key")
+    response = SystemOneClient(stub, model="stub-model", method="structured").system_one(
+        state=state, questions={"intent": question()}
+    )
+    check("reject_cache_key: the key is dropped and the answer arrives",
+          response.debug["server_limits"]["cache_key"] is False
+          and response.answers["intent"].choice == "billing",
+          str(response.debug.get("server_limits")))
+    check("reject_cache_key: the re-ask carries no key",
+          len(stub.requests) == 2 and stub.requests[1].get("prompt_cache_key") is None,
+          str(stub.requests[1].get("prompt_cache_key")))
+
+    # Caching: every request is routed, the key follows the rubric (not the state), and the usage
+    # reports what the provider read from its cache.
+    stub = StubClient(scenario="structured", surface="chat_completions")
+    client = SystemOneClient(stub, model="stub-model", method="structured")
+    first = client.system_one(state="state one", questions={"intent": question()})
+    second = client.system_one(state="state two", questions={"intent": question()})
+    other = client.system_one(
+        state="state one",
+        questions={"topic": Choice(criteria={"a": "one", "b": "two"})},
+    )
+    keys = [request.get("prompt_cache_key") for request in stub.requests]
+    check("caching: every request carries a prompt_cache_key",
+          len(keys) == 3 and all(isinstance(key, str) and key for key in keys), str(keys))
+    check("caching: the key is stable across states and follows the rubric",
+          keys[0] == keys[1] != keys[2] and other.answers["topic"].choice == "a", str(keys))
+    check("caching: the key is derived, not positional",
+          all(key.startswith("jevper-") and len(key) == len("jevper-") + 32 for key in keys), str(keys))
+    check("caching: cached_tokens is read from usage",
+          first.usage.cached_tokens == CACHED_TOKENS and second.usage.cached_tokens == CACHED_TOKENS,
+          f"{first.usage.cached_tokens}/{second.usage.cached_tokens}")
+
+    stub = StubClient(scenario="structured", surface="chat_completions", cached_tokens=None)
+    response = SystemOneClient(stub, model="stub-model", method="structured").system_one(
+        state="state one", questions={"intent": question()}
+    )
+    check("caching: a server that reports nothing stays None",
+          response.usage.cached_tokens is None, repr(response.usage.cached_tokens))
+
+    # A call with no key of its own: the derived key is what reaches the provider.
+    stub = StubClient(scenario="structured", surface="chat_completions")
+    SystemOneClient(stub, model="stub-model", method="structured", prompt_cache_key="tenant-a").system_one(
+        state="state one", questions={"intent": question()}
+    )
+    check("caching: a caller's key wins over the derived one",
+          stub.requests[0].get("prompt_cache_key") == "tenant-a",
+          str(stub.requests[0].get("prompt_cache_key")))
+
+    stub = StubClient(scenario="structured", surface="chat_completions")
+    try:
+        SystemOneClient(stub, model="stub-model", prompt_cache_key=" ")
+    except JevperError:
+        check("caching: a blank key is refused before any request", not stub.requests)
+    else:
+        check("caching: a blank key is refused before any request", False, "no error")
+
+    # An answer that never arrived: the error names the budget that ran out.
+    stub = StubClient(scenario="truncated")
+    try:
+        SystemOneClient(stub, model="stub-model", method="structured").system_one(
+            state=state, questions={"intent": question()}
+        )
+    except MalformedAnswerError as exc:
+        text = str(exc)
+        check("truncated: the error names the output budget",
+              "ran out of output tokens" in text and "max_tokens" in text, text)
+        check("truncated: the corrective retry is spent before raising", len(stub.requests) == 2,
+              str(len(stub.requests)))
+    except JevperError as exc:  # pragma: no cover - the wrong error type
+        check("truncated: the error names the output budget", False, repr(exc))
+    else:  # pragma: no cover
+        check("truncated: the error names the output budget", False, "no error")
 
     # Pinning logprobs against that provider is the trap the docs warn about: it raises, and no
     # corrective retry is spent on it.
@@ -351,6 +632,103 @@ def _run_checks() -> int:
     check("reasoning: the answer still carries a distribution",
           abs(sum(response.answers["intent"].probabilities.values()) - 1.0) < 1e-9)
 
+    # The schema travels in the prompt wherever the request cannot carry it: always on the Messages
+    # surface, and on the OpenAI surfaces once the strict schema has been dropped.
+    stub = StubClient(scenario="structured", surface="chat_completions")
+    response = SystemOneClient(
+        stub, model="stub-model", method="structured", structured_outputs=False
+    ).system_one(state=state, questions={"intent": question()})
+    check("structured_outputs=False: json_object in the request, the schema in the prompt",
+          stub.requests[0].get("response_format") == {"type": "json_object"}
+          and "validates against this JSON Schema" in stub.requests[0]["messages"][0]["content"],
+          str(stub.requests[0].get("response_format")))
+    check("structured_outputs=False: the answer still follows the schema",
+          response.answers["intent"].choice == "billing", repr(response.answers["intent"].choice))
+
+    # The Messages surface: no logprobs in the protocol at all, no schema field, a required max_tokens
+    # and thinking as a budget. `auto` starts in JSON there rather than paying to discover that.
+    stub = StubClient(scenario="structured", surface="messages")
+    response = SystemOneClient(stub, model="stub-model").system_one(state=state, questions={"intent": question()})
+    request = stub.requests[0]
+    check("messages: auto answers in JSON without a probe",
+          response.debug["api"] == "messages" and response.debug["methods"]["intent"] == "structured"
+          and len(stub.requests) == 1 and response.usage.n_calls == 1,
+          f"api={response.debug['api']} requests={len(stub.requests)}")
+    check("messages: the schema travels in the system prompt, and no schema field is sent",
+          "validates against this JSON Schema" in request.get("system", "")
+          and "response_format" not in request and "text" not in request,
+          str(request.get("system"))[:80])
+    check("messages: the system prompt is a top-level field, not a turn",
+          all(message.get("role") != "system" for message in request["messages"]),
+          str([message.get("role") for message in request["messages"]]))
+    check("messages: max_tokens is sent, 1024 by default",
+          request.get("max_tokens") == 1024, str(request.get("max_tokens")))
+    check("messages: the answer is read from the text blocks",
+          response.answers["intent"].choice == "billing", repr(response.answers["intent"].choice))
+    check("messages: cache_read_input_tokens becomes cached_tokens",
+          response.usage.cached_tokens == CACHED_TOKENS, repr(response.usage.cached_tokens))
+
+    stub = StubClient(scenario="structured", surface="messages")
+    response = SystemOneClient(
+        stub,
+        model="stub-model",
+        reasoning=ReasoningConfig(mode="native", budget_tokens=1024),
+        extra_body={"max_tokens": 2048},
+    ).system_one(state=state, questions={"intent": question()})
+    request = stub.requests[0]
+    check("messages: thinking is a budget, and extra_body raises max_tokens",
+          request.get("thinking") == {"type": "enabled", "budget_tokens": 1024}
+          and request.get("max_tokens") == 2048,
+          f"thinking={request.get('thinking')} max_tokens={request.get('max_tokens')}")
+    check("messages: a thinking block becomes a reasoning part, signature kept",
+          reasoning_text(response.reasoning) == TRACE
+          and response.reasoning[0].signature == SIGNATURE,
+          str(response.reasoning))
+
+    # A server whose protocol has no thinking field at all (vLLM's route): dropped, re-asked, reported.
+    stub = StubClient(scenario="reject_thinking", surface="messages")
+    response = SystemOneClient(
+        stub, model="stub-model", method="structured",
+        reasoning=ReasoningConfig(mode="native", budget_tokens=1024),
+    ).system_one(state=state, questions={"intent": question()})
+    check("reject_thinking: the field is dropped and the limit reported",
+          response.debug["server_limits"]["thinking"] is False
+          and response.answers["intent"].choice == "billing",
+          str(response.debug.get("server_limits")))
+    check("reject_thinking: the re-ask carries no thinking",
+          len(stub.requests) == 2 and stub.requests[1].get("thinking") is None,
+          str(stub.requests[1].get("thinking")))
+
+    # A label readout on this surface is refused before the request: the API has no logprob field.
+    stub = StubClient(scenario="structured", surface="messages")
+    try:
+        SystemOneClient(stub, model="stub-model", method="logprobs", api="messages").system_one(
+            state=state, questions={"intent": question()}
+        )
+    except UnsupportedMethodError as exc:
+        check("messages: a pinned logprobs is refused before any request",
+              not stub.requests and "structured" in str(exc), str(exc))
+    except JevperError as exc:  # pragma: no cover - the wrong error type
+        check("messages: a pinned logprobs is refused before any request", False, repr(exc))
+    else:  # pragma: no cover
+        check("messages: a pinned logprobs is refused before any request", False, "no error")
+
+    # A reasoning parser that put the whole generation in a thinking block: no answer text to read.
+    stub = StubClient(scenario="reasoning_only", surface="messages")
+    try:
+        SystemOneClient(stub, model="stub-model", method="structured").system_one(
+            state=state, questions={"intent": question()}
+        )
+    except MalformedAnswerError as exc:
+        check("reasoning_only: the error says the response carried reasoning only",
+              "carried reasoning only" in str(exc), str(exc))
+        check("reasoning_only: the corrective retry is spent first", len(stub.requests) == 2,
+              str(len(stub.requests)))
+    except JevperError as exc:  # pragma: no cover - the wrong error type
+        check("reasoning_only: the error says the response carried reasoning only", False, repr(exc))
+    else:  # pragma: no cover
+        check("reasoning_only: the error says the response carried reasoning only", False, "no error")
+
     print()
     print(f"{'all checks passed' if not failures else f'{failures} check(s) failed'}")
     return 1 if failures else 0
@@ -360,14 +738,28 @@ def _run_checks() -> int:
 
 
 def _run_live(model: str, api: str) -> int:
-    try:
-        from openai import OpenAI
-    except ImportError:
-        print("the live probe needs the openai package: pip install openai")
-        return 2
-    if not os.environ.get("OPENAI_API_KEY"):
-        print("the live probe needs OPENAI_API_KEY (set OPENAI_BASE_URL for a self-hosted server)")
-        return 2
+    if api == "messages":
+        # The Anthropic SDK speaks this one; a local server takes any key, so only the base URL matters.
+        try:
+            from anthropic import Anthropic
+        except ImportError:
+            print("--api messages needs the anthropic package: pip install anthropic")
+            return 2
+        base_url = os.environ.get("ANTHROPIC_BASE_URL") or os.environ.get("OPENAI_BASE_URL")
+        probe_client: Any = Anthropic(
+            api_key=os.environ.get("ANTHROPIC_API_KEY") or "local",
+            **({"base_url": base_url} if base_url else {}),
+        )
+    else:
+        try:
+            from openai import OpenAI
+        except ImportError:
+            print("the live probe needs the openai package: pip install openai")
+            return 2
+        if not os.environ.get("OPENAI_API_KEY"):
+            print("the live probe needs OPENAI_API_KEY (set OPENAI_BASE_URL for a self-hosted server)")
+            return 2
+        probe_client = OpenAI()
 
     from jevper import Choice, JevperError, SystemOneClient
 
@@ -379,7 +771,7 @@ def _run_live(model: str, api: str) -> int:
             "sales": "pricing, plans, purchasing, upgrades",
         },
     )
-    client = SystemOneClient(OpenAI(), model=model, api=api)
+    client = SystemOneClient(probe_client, model=model, api=api)
     try:
         response = client.system_one(
             state="I was charged twice for the same subscription this month.", questions={"intent": question}
@@ -395,6 +787,8 @@ def _run_live(model: str, api: str) -> int:
         "readout_source": response.debug["llm_attempts"][-1]["readout"]["source"],
         "answer": response.answers["intent"].model_dump(mode="json"),
         "n_calls": response.usage.n_calls,
+        "cached_tokens": response.usage.cached_tokens,
+        "server_limits": response.debug.get("server_limits"),
         "retry_reasons": response.debug["retry_reasons"],
     }, indent=2, default=str))
     return 0
@@ -405,7 +799,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--check", action="store_true", help="run the offline self-test")
     parser.add_argument("--live", action="store_true", help="ask a real provider which method it resolves to")
     parser.add_argument("--model", default=os.environ.get("LLM_MODEL", ""), help="model id for --live")
-    parser.add_argument("--api", default="auto", choices=("auto", "chat_completions", "responses"))
+    parser.add_argument("--api", default="auto", choices=("auto", "chat_completions", "responses", "messages"))
     args = parser.parse_args(argv)
 
     if args.live:

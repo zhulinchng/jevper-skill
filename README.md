@@ -10,38 +10,44 @@ npx skills add zhulinchng/jevper-skill
 
 Single-skill repo: root `SKILL.md` with valid `name` + `description` frontmatter, so the installer picks it up directly (`--list` shows it without installing; `-a '*'` installs to every detected agent).
 
+Written and verified against **jevper 0.5.0** (Python 3.10+, `pydantic>=2.7`). Every behaviour it describes — methods, fallbacks, the server-limits ladder, prompt caching, the three surfaces, error messages — was checked against that release; if you are on a newer one, its `docs/` is the authority.
+
 ## What it covers
 
 - **Questions**: `Noul` (one probability of true), `Choice` (2–255 labelled options), `Score` (2–10 ordered levels) — criteria rendered as prompts, answers carrying `choice`/`probabilities`/`confidence`, `score`/`legend`, `noul`, and how each `confidence` is computed
 - **Methods**: leave `method` unset and `auto` answers with `logprobs` where the provider returns them, `structured` where it does not, remembered per `(model, surface)`; when to pin `grammar`, `discrete`, `structured` or `logprobs` instead — and the 26-option ceiling on the two methods that read a label *token*
-- **Provider support**: who returns logprobs (OpenAI chat models, DeepSeek, Together, Ollama, llama.cpp, vLLM) and who rejects the fields (OpenAI reasoning models, Claude, Gemini's OpenAI-compatibility endpoint), with the exact error strings and a one-line probe
+- **Surfaces**: Chat Completions and Responses from an OpenAI-compatible client, plus the Anthropic **Messages** API (`api="messages"`, an `anthropic.Anthropic` client) — where no logprobs exist at all, the JSON Schema travels in the system prompt, `max_tokens` is required (jevper sends `1024`) and thinking is a `budget_tokens` field
+- **Fallbacks**: the surface move when a route is missing (404) or answers without a distribution, the capability-versus-bad-value distinction that decides what gets remembered, the finite ladder that drops a refused schema (`json_schema` → `json_object` → nothing), reasoning parameters, the Responses `include` list, `prompt_cache_key` and the Messages `thinking` field
+- **Provider support**: who returns logprobs (OpenAI chat models, DeepSeek, Together, llama.cpp, vLLM, SGLang, Ollama) and who rejects the fields (OpenAI reasoning models, Claude, Gemini's OpenAI-compatibility endpoint, OpenRouter's routing), with the exact error strings, per-surface request fields, what to pass to each local server, how to turn thinking off, and a one-line probe
+- **Prompt caching**: the state-last message order, the per-question derived `prompt_cache_key` (and how to override it), `usage.cached_tokens` and which server flag makes it appear, cache isolation via `cache_salt`, and the measured reuse numbers
 - **Reasoning**: `ReasoningConfig` — native provider reasoning vs a two-step analysis-then-answer pass, `reasoning_text()`, and the doubled call count that comes with it
 - **Few-shot examples**: `Example`, the three attachment levels and their precedence, answers rendered in the active method's format, calibration through explicit `probabilities`
 - **Async**: `AsyncSystemOneClient`, same signatures, semaphore instead of thread pool
-- **Surfaces**: Chat Completions vs Responses — logprobs via `include`, `response_format` vs `text.format`, grammar only on chat, `store=false`
-- **Client knobs**: `temperature`, `top_logprobs`, `structured_outputs`, `normalize_probabilities`, `max_concurrency`, `n_retry_malformed`, `retry`
-- **Failure triage**: which errors are local (zero requests sent), which are readout failures worth one corrective retry, which are `ProviderError`; transient retry policy; the `debug` keys that show what actually happened
+- **Client knobs**: `temperature`, `top_logprobs`, `structured_outputs`, `prompt_cache_key`, `normalize_probabilities`, `max_concurrency`, `n_retry_malformed`, `retry`, `api`
+- **Failure triage**: which errors are local (zero requests sent), which are readout failures worth one corrective retry, which are `ProviderError`; transient retry policy; answers that ended early — or carried reasoning only — and say why; the `debug` keys that show what actually happened
 - **Offline testing**: a duck-typed stub client that drives the real readout path from canned bodies — no HTTP, no key, no tokens
 
 ## Layout
 
-- `SKILL.md` — entry point: quick start, question/method/error tables, provider matrix, checklist
-- `references/features.md` — reasoning, few-shot examples, async, surfaces, client knobs
-- `references/troubleshooting.md` — provider logprob matrix, error triage, `debug` recipes, symptom → fix
-- `scripts/offline_stub.py` — duck-typed stub client (`logprobs`, `structured`, `reject_logprobs`, `no_alternatives`, `reasoning`) plus its own self-test and live probe
+- `SKILL.md` — entry point: quick start, question/method/error tables, prompt caching, checklist
+- `references/features.md` — reasoning, few-shot examples, async, surfaces, prompt caching, client knobs
+- `references/providers.md` — the observed logprob matrix, per-surface request fields, local servers, the Anthropic Messages route, cache reporting
+- `references/troubleshooting.md` — error triage, `debug` recipes, symptom → fix
+- `scripts/offline_stub.py` — duck-typed stub client, OpenAI- or Anthropic-shaped (scenarios: `logprobs`, `structured`, `reject_logprobs`, `no_alternatives`, `no_responses_route`, `reject_schema`, `reject_cache_key`, `reject_thinking`, `truncated`, `reasoning`, `reasoning_only`) plus its own self-test and live probe
 
 ## Verify
 
 ```bash
-pip install jevper                                 # Python 3.10+, pydantic>=2.7
+pip install jevper                                 # Python 3.10+, pydantic>=2.7; 0.5.0 or newer
 python scripts/offline_stub.py --check             # offline self-test: no network, no API key
 python scripts/offline_stub.py --live --model <id> # needs openai + OPENAI_API_KEY; OPENAI_BASE_URL for self-hosted
+python scripts/offline_stub.py --live --model <id> --api messages   # needs anthropic; ANTHROPIC_BASE_URL for a local server
 ```
 
-The self-test drives `StubClient` through the real jevper readout path: the logprobs softmax, the structured JSON readout, `auto`'s fallback and its per-`(model, surface)` memory, the `LabelReadoutError` a pinned `logprobs` raises against a provider that cannot do them, and two-step reasoning on the chat surface. The live probe prints which method a real provider resolves to, the readout source, and the answer — run it before writing an integration against a new model.
+The self-test drives `StubClient` through the real jevper readout path: the logprobs softmax, the structured JSON readout, `auto`'s per-`(model, surface)` memory, the surface move when a provider refuses logprobs or a route is missing, the server-limits ladder (`json_schema` → `json_object`, and the Messages `thinking` field), a refused `prompt_cache_key`, the schema that travels in the prompt when the request cannot carry one, the derived cache key and `cached_tokens` on all three usage paths, the `LabelReadoutError` a pinned `logprobs` raises against a provider that cannot do them, the message a truncated answer carries, the refusal a pinned label readout gets on the Messages surface, the error a reasoning-only answer carries, and two-step reasoning on the chat surface. The live probe prints which method a real provider resolves to, the surface, the readout source, `cached_tokens` and any server limits — run it before writing an integration against a new model.
 
 ## Reference
 
-The library is at [zhulinchng/jevper](https://github.com/zhulinchng/jevper) (Apache-2.0), where `docs/` holds the full reference — [`api.md`](https://github.com/zhulinchng/jevper/blob/main/docs/api.md), [`methods.md`](https://github.com/zhulinchng/jevper/blob/main/docs/methods.md), [`reasoning.md`](https://github.com/zhulinchng/jevper/blob/main/docs/reasoning.md), [`few-shot.md`](https://github.com/zhulinchng/jevper/blob/main/docs/few-shot.md), [`internals.md`](https://github.com/zhulinchng/jevper/blob/main/docs/internals.md).
+The library is at [zhulinchng/jevper](https://github.com/zhulinchng/jevper) (Apache-2.0), where `docs/` holds the full reference — [`api.md`](https://github.com/zhulinchng/jevper/blob/main/docs/api.md), [`methods.md`](https://github.com/zhulinchng/jevper/blob/main/docs/methods.md), [`reasoning.md`](https://github.com/zhulinchng/jevper/blob/main/docs/reasoning.md), [`few-shot.md`](https://github.com/zhulinchng/jevper/blob/main/docs/few-shot.md), [`local-servers.md`](https://github.com/zhulinchng/jevper/blob/main/docs/local-servers.md), [`internals.md`](https://github.com/zhulinchng/jevper/blob/main/docs/internals.md).
 
 `jevper` is an independent implementation of the documented System One wire format, not affiliated with, endorsed by, or supported by [TypeSafe AI](https://docs.typesafe.ai); questions about the hosted API itself belong in their docs.
