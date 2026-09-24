@@ -45,7 +45,8 @@ answer.probabilities  # {"billing": 0.88, "technical": 0.08, "sales": 0.03} — 
 answer.confidence     # 0.83
 ```
 
-Each question is answered by its own provider call, and questions run concurrently (`max_concurrency`,
+Each question is answered by its own provider call — more where reasoning, a fallback or a retry joins in —
+and questions run concurrently (`max_concurrency`,
 default 8): put the questions you need into one `system_one` call instead of looping. `state` may be a
 string, a chat message list, `{"messages": [...]}`, or any other JSON value (rendered as pretty-printed JSON
 in one user turn; a list of dicts is read as chat turns, a list of anything else as content).
@@ -123,7 +124,7 @@ which `mode="auto"` selects on its own; a server that does not know the field (S
 the call re-asked, while one that refuses the number gets its own error back.
 
 Know the refusals by sight, and let the probe in
-[Test without spending tokens](#test-without-spending-tokens) settle a new endpoint in one call:
+[Test without spending tokens](#test-without-spending-tokens) settle a new endpoint in one `system_one` call:
 
 | Refusal | Where |
 | --- | --- |
