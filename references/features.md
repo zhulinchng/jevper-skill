@@ -5,6 +5,7 @@
 - [Async](#async) — `AsyncSystemOneClient`
 - [Surfaces](#surfaces) — Chat Completions, Responses and Messages, and the fallbacks between them
 - [Prompt caching](#prompt-caching) — message order, `prompt_cache_key`, `usage.cached_tokens`
+- [Tracing with MLflow](#tracing-with-mlflow) — autolog spans for every request, hosting jevper as a model
 - [Client knobs](#client-knobs) — the options worth changing
 
 ## Reasoning
@@ -123,20 +124,22 @@ shape is then only as good as the model's instruction-following.
 
 `auto` also falls back between the surfaces, and both verdicts are remembered for the client's life:
 
-- A **404 that does not name the model** is a missing route: the call is re-asked on
-  `chat_completions`. A 404 that quotes the model (`ollama` and `vLLM` answer a bad model id that way) is
-  about the model and is reported as it stands. An explicit `api="responses"` never falls back. When there
-  is no surface left to try — a Messages-only client whose server has no `/v1/messages` route — the 404 is
-  raised as a `ProviderError` with `status_code=404`, a missing route being the provider's failure rather
-  than a verdict jevper keeps. The remembered verdict is applied *before* the client's attributes are
-  checked on a later call, though, so a single-surface client then fails with a `ProviderError` whose
-  message is `AttributeError: … has no attribute 'responses'`; pass the surface explicitly
-  (`api="messages"`) to have every call report the 404 itself.
+- A **404 that does not name the model** is a missing route: the call is re-asked on the other surface. A
+  404 that quotes the model (`ollama` and `vLLM` answer a bad model id that way) is about the model and is
+  reported as it stands. An explicit `api="responses"` never falls back. The remembered verdict only ever
+  *skips* a route, and only where the client can speak the other one: a client whose only surface is
+  `messages` stays on it, pays the 404 again, and reports it as a `ProviderError` with `status_code=404` on
+  every call — the same error the call that learned the verdict raised.
 - A **surface that answers without a distribution** is marked and left behind for that model — ollama's
-  Responses route returns an empty logprob list, llama.cpp's refuses the fields — so later calls start where
-  the distribution is. A distribution arriving later on a marked surface clears the mark.
-- `reasoning="native"` stops the move: native reasoning exists only on Responses, so switching would
-  silently turn it into a two-step pass.
+  Responses route returns an empty logprob list, llama.cpp's refuses the fields, OpenRouter's refuses the
+  logprob includable outright — so later calls start where the distribution is. A distribution arriving later
+  on a marked surface clears the mark. With no surface left to move to, the readout falls back to
+  `structured`; `reasoning="native"` stops the move (native reasoning exists only on Responses), and so does
+  a `grammar` request, which is a Chat Completions convention the other surface cannot carry.
+- A **pinned `method="logprobs"` moves too**, keeping its method: it asked for a distribution, not for a
+  particular surface to produce one, and the surface that refuses is not the method the caller chose. It is
+  never *swapped* for another readout — with nowhere to move, the provider's refusal is reported as a
+  `LabelReadoutError` whose message says the provider rejected the logprob request.
 - The Messages surface is never asked for a label readout at all: `method="logprobs"`/`"grammar"` raise
   `UnsupportedMethodError` before any request, and `auto` starts in JSON there.
 
@@ -179,6 +182,38 @@ that refuses the `prompt_cache_key` field has it dropped and the call re-asked, 
 prefixes, different salts cannot see each other's — so pass `extra_body={"cache_salt": tenant_id}` when
 tenants share a server. vLLM caps it at 128 characters and rejects `@`, `/`, `\` and NUL; the other servers
 ignore the field. Per-server reporting and the measured reuse: [providers.md](providers.md).
+
+## Tracing with MLflow
+
+jevper imports nothing from MLflow and MLflow is not a dependency, so the integration is the SDK's own:
+`mlflow.openai.autolog()` and `mlflow.anthropic.autolog()` patch the OpenAI and Anthropic *resource classes*,
+so every call jevper makes through a real SDK client becomes a span — the attempts it settles away from
+included, which is the part `debug["llm_attempts"]` only summarises. One `system_one` call is a trace when
+you wrap it in `@mlflow.trace`, and each question's span hangs under it.
+
+| jevper surface | Span name |
+| --- | --- |
+| `api="chat_completions"` | `Completions` (`AsyncCompletions` from an async client) |
+| `api="responses"` | `Responses` (`AsyncResponses` async) |
+| `api="messages"` | `Messages.create` (`AsyncMessages.create` async) |
+
+On a span: `mlflow.spanInputs`/`mlflow.spanOutputs` hold the kwargs jevper built and the raw provider
+response, `mlflow.chat.tokenUsage` the token counts (absent entirely when the provider sent no usage at
+all, null-valued when it sent one with fields missing), `mlflow.llm.model` the model, `mlflow.llm.provider`
+`anthropic` on the Messages route, `mlflow.message.format` `openai` or `anthropic`, and
+`mlflow.spanLogLevel` `20` for a call that returned, `40` for one that raised. The status follows the *SDK
+call*, not jevper's reading of the answer: a refusal or a spent budget arrives as an HTTP `200`, so the span
+is `OK` while jevper raises `MalformedAnswerError` — the span says what the provider said, the error says
+whether an answer came out. A duck-typed client of your own is invisible to autolog; wrap it in
+`@mlflow.trace` yourself. `mlflow.tracing.disable()` stops recording, an unwritable tracking store does not
+break the call, and `mlflow.flush_trace_async_logging()` forces the asynchronous export out.
+
+Hosting jevper as a model is the other half: subclass `mlflow.pyfunc.ResponsesAgent` (recommended since
+MLflow 3.0) or the deprecated `ChatModel`, build the client in `load_context` — a pickled instance cannot
+carry one — and log it with `python_model="<path>"`. `log_model` runs your `input_example` through the model
+while logging, so an integration that cannot answer its own example fails there, not later. The standalone
+`mlflow gateway start` is deprecated in favour of the server-hosted gateway. Full detail, verified against
+MLflow 3.16.1, is the library's `docs/mlflow.md`; the extra is `pip install 'mlflow[gateway,langchain]>=3.16'`.
 
 ## Client knobs
 

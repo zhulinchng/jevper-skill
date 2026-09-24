@@ -8,7 +8,7 @@
 
 ## Does this provider do logprobs?
 
-Observed against each provider's live API, as of jevper 0.5.1 — providers move, so treat a row as a
+Observed against each provider's live API, as of jevper 0.5.2 — providers move, so treat a row as a
 starting point rather than a law, and let `auto` verify it per `(model, surface)` for you.
 
 | Provider | `logprobs` | Note |
@@ -25,7 +25,7 @@ starting point rather than a law, and let `auto` verify it per `(model, surface)
 | llama.cpp | yes | Chat Completions only: the `/v1/responses` shim refuses the fields (`400 top_logprobs requires logprobs to be set to true`), so `auto` re-asks on Chat Completions |
 | vLLM | yes | caps `top_logprobs` at `--max-logprobs` (20 by default); its `/v1/responses` carries them through `include` |
 | SGLang | yes | its `/v1/responses` needs `top_logprobs` sent explicitly (it defaults to 0) — jevper always sends it |
-| OpenRouter | per model | it routes by price, and the endpoint it picks may ignore `logprobs`; add `extra_body={"provider": {"require_parameters": True}}` to route only to endpoints that support every field you send. Its Responses API refuses the logprob includable (`400 Invalid option: expected one of …` at `path: ["include", 0]`), so `api="auto"` there resolves to `structured` |
+| OpenRouter | per model | it routes by price, and the endpoint it picks may ignore `logprobs`; add `extra_body={"provider": {"require_parameters": True}}` to route only to endpoints that support every field you send. Its Responses API refuses the logprob includable (`400 Invalid option: expected one of …` at `path: ["include", 0]`), so a label readout there moves to Chat Completions, where the distribution arrives — with a pinned `method="logprobs"` as much as with `auto` |
 | everything else | unknown | reasoning models and thin compatibility layers are the ones that say no |
 
 With `auto` you do not have to know this table. Probe a new endpoint before writing code, or after
@@ -72,14 +72,19 @@ as its instruction-following: on such a surface expect more `MalformedAnswerErro
 A client object cannot say whether the *server* implements a route — `openai.OpenAI` exposes
 `responses.create` either way — so `auto` reads the responses:
 
-- **404 that does not name the model** → the route is missing: the call is re-asked on
-  `chat_completions` and remembered for the client's life. `ollama` and `vLLM` answer a bad model id with a
-  404 that quotes the model; those are reported as they stand, on either surface.
+- **404 that does not name the model** → the route is missing: the call is re-asked on the other surface
+  and remembered for the client's life — but only where the client can speak it. A Messages-only client
+  whose host has no `/v1/messages` route keeps re-asking and keeps reporting the 404
+  (`ProviderError`, `status_code=404`) rather than moving to an attribute it does not have. `ollama` and
+  `vLLM` answer a bad model id with a 404 that quotes the model; those are reported as they stand, on
+  either surface.
 - **A surface that answers without a distribution** → marked and left behind for that model: ollama's
-  Responses route returns an empty logprob list and llama.cpp's refuses the fields, while Chat Completions
-  on both carries the full distribution. A distribution arriving later on a marked surface clears the mark.
+  Responses route returns an empty logprob list, llama.cpp's refuses the fields and OpenRouter's refuses
+  the includable, while Chat Completions on all three carries the full distribution. A distribution
+  arriving later on a marked surface clears the mark.
 - **`reasoning="native"` pins the surface**, because native reasoning is the reason to prefer Responses and
-  switching would turn it into a two-step pass silently.
+  switching would turn it into a two-step pass silently — and so does a `grammar` request, which the other
+  surface cannot carry. A pinned `method="logprobs"` does move, keeping its method.
 - An explicit `api="responses"` is a decision, not a preference: its 404 reaches you unchanged.
 
 When a server refuses a request field jevper added — `response_format`, `text.format`, `reasoning_effort`,
@@ -91,7 +96,7 @@ question.
 ## Local servers
 
 A local server is the same client with a different `base_url`. Checked against ollama 0.34, llama.cpp
-b11139, vLLM 0.30 and SGLang 0.5.20 serving `Qwen3.5-9B` at 4-bit on one 12 GB card.
+b11139, vLLM 0.30 and SGLang 0.5.20 serving `Qwen3.5-9B` at 4-bit on one 12 GB card, and LM Studio 0.4.1.
 
 | Server | `base_url` | `model` | Thinking off | Notes |
 | --- | --- | --- | --- | --- |
@@ -99,18 +104,19 @@ b11139, vLLM 0.30 and SGLang 0.5.20 serving `Qwen3.5-9B` at 4-bit on one 12 GB c
 | llama.cpp | `http://127.0.0.1:8080/v1` | the `--alias` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--jinja`; the only server that honours `grammar` |
 | vLLM | `http://127.0.0.1:8000/v1` | the `--served-model-name` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--reasoning-parser qwen3`; `top_logprobs` capped by `--max-logprobs` (20) |
 | SGLang | `http://127.0.0.1:30000/v1` | the `--served-model-name` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--reasoning-parser qwen3`; its Responses route needs `top_logprobs`, which jevper always sends |
+| LM Studio | `http://127.0.0.1:1234/v1` | the id `lms ls` prints | nothing reliably — load an instruct model | the only one here answering all three surfaces, so `auto` finds Responses, Chat Completions and Messages on one box; logprobs arrive on both OpenAI surfaces, but its Responses route ignores the schema, so structured answers belong on Chat Completions |
 
-`api="auto"` works against all four: it prefers Responses, and when that route is missing or answers
+`api="auto"` works against all five: it prefers Responses, and when that route is missing or answers
 without a distribution it re-asks on Chat Completions and remembers the verdict. `api="chat_completions"`
 skips the discovery entirely.
 
 **Thinking is the one decision you must make.** `logprobs`, `grammar` and `discrete` read a one-token
-answer, and all four servers report logprobs for *every* generated token — with thinking on, that is the
-first token of the reasoning, not the label, and the readout raises `LabelReadoutError`. Turn it off for
-classification work: it costs a whole reasoning pass to choose one letter. Llama.cpp also accepts
-`reasoning_effort: "none"` (its `--jinja` template) and `reasoning_budget: 0`; ollama's native API has a
-per-model `think` setting. `structured` and `discrete` are unaffected by thinking — they read the answer
-text, and the trace lands in `response.reasoning`.
+answer, and every one of these servers reports logprobs for *every* generated token — with thinking on,
+that is the first token of the reasoning, not the label, and the readout raises `LabelReadoutError`. Turn
+it off for classification work: it costs a whole reasoning pass to choose one letter. Llama.cpp also
+accepts `reasoning_effort: "none"` (its `--jinja` template) and `reasoning_budget: 0`; ollama's native API
+has a per-model `think` setting. `structured` and `discrete` are unaffected by thinking — they read the
+answer text, and the trace lands in `response.reasoning`.
 
 A label readout also survives thinking when the server separates the trace *and* the token stream ends
 exactly with the answer text: jevper anchors on that tail and reads the answer's own first token. The
@@ -118,8 +124,8 @@ anchor is strict on purpose, with one allowance — vLLM and SGLang append their
 (`<|im_end|>`) after the answer, so up to two trailing tokens that cannot be part of the answer are
 dropped before the tail is tested.
 
-All four ignore unknown request fields, so a field that does not apply is not an error. Two exceptions
-and three silent ones:
+All five ignore unknown request fields, so a field that does not apply is not an error. Two exceptions,
+and the silent ones:
 
 - `grammar` is a llama.cpp convention — ollama, vLLM and SGLang ignore it, the model answers
   unconstrained, and the label readout reports a non-label first token instead of a grammar failure.
@@ -132,6 +138,17 @@ and three silent ones:
 - A `developer`-role message is a `400` (`Unexpected message role.`) on SGLang. jevper's own turns never
   use another role and a chat-list `state`'s `system`/`developer` turns are folded into the system prompt,
   so keep `state` to `system`/`user`/`assistant`.
+- LM Studio's Responses route accepts `text.format` with a strict `json_schema` and **ignores it**
+  (structured output is a Chat Completions feature there; bug-tracker #2403, #1396). jevper sent the
+  schema in the request, so — the field being accepted — it is not repeated in the prompt, and
+  `method="structured"` on that surface reads whatever the model invents. Use `api="chat_completions"`, or
+  `method="logprobs"`, for structured work there.
+- An unknown path is not a `404` on LM Studio: it answers `200` with
+  `{"error": "Unexpected endpoint or method. (POST /…)"}` (#618), which jevper reads as an embedded
+  provider error rather than a missing route — right for a real endpoint failing, but do not rely on route
+  discovery to catch a typo'd path there.
+- LM Studio's routes disagree about `reasoning_effort`: honoured on `/v1/responses`, ignored on
+  `/v1/chat/completions` (#2413). `/v1/responses` also ignores `instructions` (#1154).
 
 The library's [local-servers.md](https://github.com/zhulinchng/jevper/blob/main/docs/local-servers.md)
 holds the full measurements: raw HTTP shapes per server, cache inspection and flush endpoints, and what
@@ -202,8 +219,10 @@ what they disagree on is telling you it happened.
 jevper reads all three paths into `usage.cached_tokens` and leaves it `None` when the server says nothing —
 which is why the flag matters if you want the number on vLLM or SGLang. A reported `0` is a cold or
 disabled cache and is preserved as `0`. A server that refuses the `prompt_cache_key` field has it dropped
-and the call re-asked (`debug["server_limits"]["cache_key"] is False`); on all four local servers the field
-is accepted with `200` and ignored.
+and the call re-asked (`debug["server_limits"]["cache_key"] is False`); on all five local servers the field
+is accepted with `200` and ignored. LM Studio reports per route rather than per server: Chat Completions
+carries no cached-token count at all (so `usage.cached_tokens` is `None` even when the cache was used),
+Responses reports `input_tokens_details.cached_tokens` and Messages `cache_read_input_tokens`.
 
 Reuse depends on message order — the state goes last, so a rubric's calls share everything before it.
 Measured on one 2388-token prompt (two examples, a ~1300-token state), second call differing only in the

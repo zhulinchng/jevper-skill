@@ -10,10 +10,11 @@
 `auto` reads the provider for you: it asks for logprobs, and on a 4xx that names the logprob fields, an
 answer with no logprobs, or an answer token with no alternatives, it re-asks with `structured` and
 remembers the verdict per `(model, surface)` for the rest of the client's life. Before that fallback it
-tries the *other surface* when the client exposes one and the reasoning mode is not `native`, and a 404
-that does not name the model is read as a missing route and answered on `chat_completions` instead. A
-rejection that names a *value* rather than a field (`top_logprobs must be between 0 and 20`) and a 5xx that
-survives its retries both fall back for that question alone, without being remembered. The same distinction
+tries the *other surface* when the client exposes one and the reasoning mode is not `native` — a pinned
+`method="logprobs"` takes that move too, keeping its method — and a 404 that does not name the model is
+read as a missing route, answered on the other surface where the client has one. A rejection that names a
+*value* rather than a field (`top_logprobs must be between 0 and 20`) and a 5xx that survives its retries
+both fall back for that question alone, without being remembered. The same distinction
 holds on the capability ladder: only a complaint about a field's *existence* drops it — a server that
 refuses the number in a field it knows (`budget_tokens: must be at least 1024`) keeps its own error, because
 answering with your reasoning silently switched off would be worse than failing.
@@ -95,8 +96,8 @@ is `None` when any constituent call omitted it — a reported `0` is preserved.
 | `JevperError: prompt_cache_key must be …` | the key is checked before any request: pass a non-blank string of at most 256 characters |
 | `UnsupportedMethodError` on an Anthropic-compatible client | that API has no logprobs: use `structured`/`discrete`, or an OpenAI-compatible client for a label readout. `auto` already answers in JSON there |
 | `ClientCapabilityError: client has no messages.create …` | you passed `api="messages"` with an OpenAI client: pass an `anthropic.Anthropic` (or another client exposing `messages.create`), or use one of the OpenAI surfaces |
-| `ProviderError` with `status_code=404` and a message about a missing route | the server has no such route and the client has no other surface to try, so the 404 is the answer: check the `base_url` and port, or use an OpenAI-compatible client |
-| `ProviderError` reading `AttributeError: … has no attribute 'responses'`, on the *second* call | the same missing route, now remembered: the next call moves to the other surface before checking that the client has one. Pass `api="messages"` to fix the surface — the underlying 404 is then reported as a `ProviderError` on every call |
+| `ProviderError` with `status_code=404` and a message about a missing route | the server has no such route and the client has no other surface to try, so the 404 is the answer on every call: check the `base_url` and port, or use a client that speaks the other surface |
+| `LabelReadoutError: the provider rejected the logprob request …` under a pinned `method="logprobs"` | the surface that refused has no alternative to move to, and the readout is never swapped for `structured`: drop the pin, or name a surface that carries the distribution (`api="chat_completions"`). `auto` does both by itself |
 | `MalformedAnswerError` mentioning reasoning only | a reasoning parser put the whole generation in a thinking block and returned no answer text: turn thinking off ([providers.md](providers.md)) — on SGLang also drop `--reasoning-parser` when serving a model that never emits the closing marker |
 | `MalformedAnswerError` on a provider without strict schema support | `structured_outputs=False` sends `{"type": "json_object"}` instead and the schema travels in the system prompt, so the answer's shape is only as good as instruction-following — keep descriptions unambiguous, set `temperature=0.0`, and raise `n_retry_malformed` |
 | An empty answer, or `finish_reason: "length"` / `incomplete_details.reason: "max_output_tokens"` / `stop_reason: "max_tokens"` in the message | the output budget went to the reasoning: turn thinking off ([providers.md](providers.md)) and bound the output explicitly (`extra_body={"max_tokens": 512}`) |

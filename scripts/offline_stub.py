@@ -2,8 +2,8 @@
 
 Why: jevper is duck-typed, so a plain object is enough to drive it end to end — no HTTP, no API key, no
 tokens spent — while the real readout path (logprobs softmax, structured JSON, ``auto``'s fallback and
-surface move, the server-limits ladder, the schema that travels in the prompt when the request cannot
-carry one) runs for real.
+surface move, the same move under a pinned ``method="logprobs"``, the server-limits ladder, the schema
+that travels in the prompt when the request cannot carry one) runs for real.
 
     from offline_stub import StubClient
     from jevper import Choice, SystemOneClient
@@ -22,7 +22,11 @@ Scenarios:
     reject_logprobs      a provider that answers 400 to the logprob fields (OpenAI reasoning models,
                          Gemini's OpenAI-compatibility layer)
     no_alternatives      a provider that reports the sampled token and nothing else
+    reject_include       a server that refuses the Responses logprob includable and carries the
+                         distribution on Chat Completions instead (OpenRouter's shape)
     no_responses_route   a server that answers 404 for /v1/responses — a missing route, not a bad model
+    no_messages_route    a server that answers 404 for /v1/messages — the mirror of no_responses_route,
+                         and the case where there is no other surface to move to
     reject_schema        a server that answers 400 to a strict JSON schema, and accepts ``json_object``
     reject_format        a server with no format field at all: it refuses ``json_object`` too, so the
                          ladder has one rung fewer to walk
@@ -62,8 +66,10 @@ SCENARIOS = (
     "logprobs",
     "structured",
     "reject_logprobs",
+    "reject_include",
     "no_alternatives",
     "no_responses_route",
+    "no_messages_route",
     "reject_schema",
     "reject_format",
     "reject_cache_key",
@@ -366,6 +372,10 @@ class StubClient:
         if self.scenario == "no_responses_route" and surface == "responses":
             # A server that never implemented the route: a 404 that says nothing about the model.
             raise Rejection("Not Found", status_code=404)
+        if self.scenario == "no_messages_route" and surface == "messages":
+            # A server that never implemented Anthropic's route. With a Messages-only client there is
+            # nowhere to move, so this is the 404 jevper must keep reporting, call after call.
+            raise Rejection("Not Found", status_code=404)
 
         schema = _requested_schema(kwargs) or _prompt_schema(kwargs)
         if self.scenario == "reject_schema" and _requested_schema(kwargs) is not None:
@@ -382,6 +392,10 @@ class StubClient:
         if self.scenario == "reject_budget_value" and kwargs.get("thinking") is not None:
             # SGLang again, but refusing the number rather than the field: not a capability verdict.
             raise Rejection("budget_tokens: must be at least 1024")
+        if self.scenario == "reject_include" and surface == "responses" and kwargs.get("include"):
+            # OpenRouter's Responses API refuses the logprob includable outright, without ever writing
+            # the word "logprob"; the same server carries the distribution on Chat Completions.
+            raise Rejection('Invalid option: expected one of "chat", "message". at path: ["include", 0]')
         if self.scenario == "reject_logprobs" and _wants_logprobs(kwargs):
             raise Rejection()
 
@@ -419,7 +433,7 @@ class StubClient:
                 return body(
                     kwargs, entries=self._entries(kwargs, alternatives=1), cached=self.cached_tokens
                 )
-            if self.scenario in ("logprobs", "reasoning", "no_responses_route"):
+            if self.scenario in ("logprobs", "reasoning", "no_responses_route", "reject_include"):
                 return body(kwargs, entries=self._entries(kwargs), cached=self.cached_tokens)
             return body(kwargs, entries=[], cached=self.cached_tokens)  # no logprobs to give back
 
@@ -542,6 +556,7 @@ def _run_checks() -> int:
     # A server with no Responses route: auto re-asks on Chat Completions and remembers the route.
     stub = StubClient(scenario="no_responses_route")
     client = SystemOneClient(stub, model="stub-model")
+
     response = client.system_one(state=state, questions={"intent": question()})
     check("no_responses_route: auto re-asks on chat_completions",
           response.debug["api"] == "chat_completions" and response.usage.n_calls == 1
@@ -556,6 +571,64 @@ def _run_checks() -> int:
     check("no_responses_route: the missing route is remembered",
           len(stub.requests) == before + 1 and stub.surfaces[-1] == "chat_completions",
           str(stub.surfaces[-2:]))
+
+    # A Messages-only client whose one route is missing: there is nowhere to move, so every call must
+    # keep reporting the 404 the first one found — never an AttributeError for a surface it cannot speak.
+    stub = StubClient(scenario="no_messages_route", surface="messages")
+    client = SystemOneClient(stub, model="stub-model")
+    reported = []
+    for _ in range(2):
+        try:
+            client.system_one(state=state, questions={"intent": question()})
+        except ProviderError as exc:
+            reported.append((exc.status_code, "no 'messages' route" in str(exc)))
+        else:
+            reported.append((None, False))
+    check("no_messages_route: a client with one surface reports the 404 on every call",
+          reported == [(404, True), (404, True)] and stub.surfaces == ["messages", "messages"],
+          f"reported={reported} surfaces={stub.surfaces}")
+
+    # OpenRouter's shape: the Responses route refuses the logprob includable, Chat carries it. A pinned
+    # method="logprobs" asked for a distribution, not for a surface, so the readout moves and keeps it.
+    stub = StubClient(scenario="reject_include")
+    client = SystemOneClient(stub, model="stub-model", method="logprobs")
+    response = client.system_one(state=state, questions={"intent": question()})
+    check("reject_include: a pinned logprobs readout moves to the surface that carries it",
+          response.debug["api"] == "chat_completions" and response.debug["method"] == "logprobs"
+          and stub.surfaces == ["responses", "chat_completions"]
+          and response.answers["intent"].choice == "billing",
+          f"api={response.debug['api']} method={response.debug['method']} surfaces={stub.surfaces}")
+    before = len(stub.requests)
+    client.system_one(state=state, questions={"intent": question()})
+    check("reject_include: the move is remembered, so the refusal is paid once",
+          len(stub.requests) == before + 1 and stub.surfaces[-1] == "chat_completions",
+          str(stub.surfaces[-2:]))
+
+    # With nowhere to move, the provider's refusal is the answer: the method is never swapped for JSON.
+    stub = StubClient(scenario="reject_include", surface="responses")
+    try:
+        SystemOneClient(stub, model="stub-model", method="logprobs").system_one(
+            state=state, questions={"intent": question()}
+        )
+    except LabelReadoutError as exc:
+        refusal = "rejected the logprob request" in str(exc)
+    else:
+        refusal = False
+    check("reject_include: with nowhere to move the refusal is reported, not another readout",
+          refusal and stub.surfaces == ["responses"], f"surfaces={stub.surfaces}")
+
+    # A grammar request is a Chat Completions convention, so a logprob verdict is no reason to move it.
+    stub = StubClient(scenario="reject_logprobs")
+    try:
+        SystemOneClient(stub, model="stub-model", method="grammar").system_one(
+            state=state, questions={"intent": question()}
+        )
+    except LabelReadoutError:
+        stayed = stub.surfaces == ["chat_completions"]
+    else:
+        stayed = False
+    check("reject_logprobs: a grammar readout stays on chat, where the grammar lives",
+          stayed and "grammar" in stub.requests[0], str(stub.surfaces))
 
     # A server that refuses a strict schema: the ladder drops to `json_object` and answers anyway.
     stub = StubClient(scenario="reject_schema")
@@ -683,8 +756,8 @@ def _run_checks() -> int:
     else:  # pragma: no cover
         check("truncated: the error names the output budget", False, "no error")
 
-    # Pinning logprobs against that provider is the trap the docs warn about: it raises, and no
-    # corrective retry is spent on it.
+    # Pinning logprobs against that provider is the trap the docs warn about: it raises, spends the one
+    # surface move it is allowed, and is never swapped for the structured readout that would have worked.
     stub = StubClient(scenario="structured")
     try:
         SystemOneClient(stub, model="stub-model", method="logprobs").system_one(
@@ -692,7 +765,9 @@ def _run_checks() -> int:
         )
     except LabelReadoutError as exc:
         check("pinned logprobs without provider support raises LabelReadoutError", True)
-        check("pinned logprobs is not corrective-retried", len(stub.requests) == 1, str(len(stub.requests)))
+        check("pinned logprobs spends the surface move and nothing else",
+              len(stub.requests) == 2 and stub.surfaces == ["responses", "chat_completions"],
+              f"requests={len(stub.requests)} surfaces={stub.surfaces}")
         check("pinned logprobs names the alternatives", "structured" in str(exc), str(exc))
     except JevperError as exc:  # pragma: no cover - the wrong error type
         check("pinned logprobs without provider support raises LabelReadoutError", False, repr(exc))

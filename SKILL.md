@@ -13,7 +13,7 @@ hosted models and self-hosted llama.cpp/vLLM/Ollama/SGLang servers work the same
 rendered last so a rubric's prompts share a cacheable prefix. `openai` and `anthropic` are not runtime
 dependencies; `pydantic>=2.7` is. Python 3.10+.
 
-Written against jevper 0.5.1; if you are on a newer release, check its `docs/` — the library is the
+Written against jevper 0.5.2; if you are on a newer release, check its `docs/` — the library is the
 authority.
 
 ## Quick start
@@ -94,11 +94,16 @@ off is worse than failing loudly.
 
 Before giving up on logprobs, `auto` tries the other surface when the client exposes one and the reasoning
 mode is not `native`, because a server can implement a route and still not carry logprobs through it
-(ollama's `/v1/responses` answers with an empty list, llama.cpp's refuses the fields outright). It also
-reads a 404 that does not name the model as "no such route" and re-asks on the other surface. Both verdicts
-are remembered. Cost: the first question of the first call pays with one extra provider call, and a
-dual-surface client spends up to three requests on it (the surface move, then the method fallback) —
-requests the provider rejected are not counted in `usage.n_calls`.
+(OpenRouter's Responses API refuses the logprob includable, ollama's `/v1/responses` answers with an empty
+list, llama.cpp's refuses the fields outright). A pinned `method="logprobs"` takes that same move — it asked
+for a distribution, not for a particular surface to produce one — and keeps its method; with nowhere to
+move it reports the provider's refusal rather than answering in JSON. A `grammar` request never moves: it
+is a Chat Completions convention the other surface cannot carry. `auto` also reads a 404 that does not name
+the model as "no such route" and re-asks on the other surface, but only where the client can speak it — a
+Messages-only client keeps re-asking and keeps reporting the 404. All of these verdicts are remembered.
+Cost: the first question of the first call pays with one extra provider call, and a dual-surface client
+spends up to three requests on it (the surface move, then the method fallback) — requests the provider
+rejected are not counted in `usage.n_calls`.
 
 `api="messages"` (an `anthropic.Anthropic` client) is the third surface and the only one with no label
 readout: no logprobs exist in that API, so `auto` answers with `structured` there without spending a call,
@@ -182,13 +187,17 @@ Three groups, and only the middle one is worth catching for control flow:
 | --- | --- | --- |
 | `InvalidQuestionError`, `UnsupportedMethodError`, `ClientCapabilityError` | before any request: bad question or example (every example is checked up front, before the first call), `grammar` on the wrong surface or `logprobs`/`grammar` on the Messages surface, client missing the attribute a surface needs, or a response with no usable first choice and no explanation | fix the code — these cost nothing and never need a retry |
 | `LabelReadoutError`, `MalformedAnswerError` | the answer could not be read; retried once by default (`n_retry_malformed`) with a correction turn | usually leave it alone; `auto` turns the provider-side cases into `structured` instead |
-| `ProviderError` | a provider call failed after transient retries; `.attempts` and `.status_code` hold the history, including a status carried inside a `200` body (OpenRouter), and it is also what you get when every surface `auto` could try answered `404` — a missing route is the provider's failure, not a verdict jevper keeps | the only one worth a retry loop of your own, and the one to catch at a service boundary |
+| `ProviderError` | a provider call failed after transient retries; `.attempts` and `.status_code` hold the history, including a status carried inside a `200` body (OpenRouter), and it is also what you get when no surface the client can speak has the route — a missing route is the provider's failure, not a verdict jevper keeps | the only one worth a retry loop of your own, and the one to catch at a service boundary |
 
 `JevperError` is the base class — catch it if you want one handler for everything, including constructor
 misuse, a bad `state` message, and content that is not JSON-serializable or carries a non-finite number.
 Transient failures (`408`, `429`, `500`, `502`, `503`, `504`, `529`, connection and timeout errors, httpx
 transport errors) are retried per call with `RetryPolicy(n_retries=2, base_delay=0.5, max_delay=8.0)`, at
 `min(base_delay · 3ⁿ, max_delay)`; a `Retry-After` header is not read.
+
+MLflow traces the same story without jevper's help: `mlflow.openai.autolog()` and `mlflow.anthropic.autolog()`
+patch the SDK, so every request jevper made — the ones it settled away from included — is a span under your
+own `@mlflow.trace` one. [references/features.md](references/features.md#tracing-with-mlflow).
 
 A server that refuses a field jevper added for capability does not fail the call: `response_format` (or
 `text.format`) walks `json_schema` → `json_object` → nothing, then the reasoning parameters, then the
@@ -223,11 +232,11 @@ Three traps worth knowing:
 ## Test without spending tokens
 
 `scripts/offline_stub.py` is a duck-typed client that answers from canned bodies — no HTTP, no key — while
-the real readout path (logprobs softmax, structured JSON, `auto`'s fallback and surface move, the
-server-limits ladder and the refusals it does not absorb, the schema that travels in the prompt when the
-request cannot carry one, the message a truncated or refused answer carries) runs end to end. Its `surface=`
-knob picks which endpoints the fake client exposes: `chat_completions`, `responses`, `messages` (the
-Anthropic shape) or `both`.
+the real readout path (logprobs softmax, structured JSON, `auto`'s fallback and surface move, the same move
+under a pinned `method="logprobs"`, the server-limits ladder and the refusals it does not absorb, the schema
+that travels in the prompt when the request cannot carry one, the message a truncated or refused answer
+carries) runs end to end. Its `surface=` knob picks which endpoints the fake client exposes:
+`chat_completions`, `responses`, `messages` (the Anthropic shape) or `both`.
 
 ```python
 import sys
@@ -243,9 +252,9 @@ assert response.debug["methods"]["intent"] == "structured"   # auto fell back
 assert stub.requests[0]["logprobs"] is True                  # and it did ask for logprobs first
 ```
 
-Scenarios: `logprobs`, `structured`, `reject_logprobs`, `no_alternatives`, `no_responses_route`,
-`reject_schema`, `reject_format`, `reject_cache_key`, `reject_thinking`, `reject_budget_value`,
-`truncated`, `refusal`, `reasoning`, `reasoning_only`. Run
+Scenarios: `logprobs`, `structured`, `reject_logprobs`, `reject_include`, `no_alternatives`,
+`no_responses_route`, `no_messages_route`, `reject_schema`, `reject_format`, `reject_cache_key`,
+`reject_thinking`, `reject_budget_value`, `truncated`, `refusal`, `reasoning`, `reasoning_only`. Run
 `python scripts/offline_stub.py --check` from the skill directory for a self-test, and
 `python scripts/offline_stub.py --live --model <id>` (add `--api messages` for an Anthropic-compatible
 server) with real credentials to see which method that provider actually resolves to, on which surface,
