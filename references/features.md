@@ -5,7 +5,7 @@
 - [Async](#async) — `AsyncSystemOneClient`
 - [Surfaces](#surfaces) — Chat Completions, Responses and Messages, and the fallbacks between them
 - [Prompt caching](#prompt-caching) — message order, `prompt_cache_key`, `usage.cached_tokens`
-- [Tracing with MLflow](#tracing-with-mlflow) — autolog spans for every request, hosting jevper as a model
+- [Tracing with MLflow](#tracing-with-mlflow) — autolog spans for calls through real SDK clients, including fallbacks, and MLflow model hosting
 - [Client knobs](#client-knobs) — the options worth changing
 
 ## Reasoning
@@ -115,7 +115,8 @@ always sends `max_tokens` there (`1024`, or `1024` plus `ReasoningConfig(budget_
 requires the budget to be strictly below it; `extra_body={"max_tokens": n}` overrides both). Any other
 provider field goes through `extra_body` — a key you name there is what reaches the wire, because the SDK
 merges `extra_body` after the typed parameters, and a capability field among them is dropped along with
-jevper's own when a server has refused it.
+jevper's own when a server has refused it. (On the Messages surface in 0.5.3 that body is attached only when a
+`temperature` is set and jevper's own thinking is off — see [Client knobs](#client-knobs).)
 
 Wherever the request cannot state the answer's shape, the JSON Schema travels in the prompt instead: always
 on the Messages surface, and on the OpenAI surfaces when `structured_outputs=False` or the server refused the
@@ -188,8 +189,11 @@ ignore the field. Per-server reporting and the measured reuse: [providers.md](pr
 jevper imports nothing from MLflow and MLflow is not a dependency, so the integration is the SDK's own:
 `mlflow.openai.autolog()` and `mlflow.anthropic.autolog()` patch the OpenAI and Anthropic *resource classes*,
 so every call jevper makes through a real SDK client becomes a span — the attempts it settles away from
-included, which is the part `debug["llm_attempts"]` only summarises. One `system_one` call is a trace when
-you wrap it in `@mlflow.trace`, and each question's span hangs under it.
+included, which is the part `debug["llm_attempts"]` only summarises. Each SDK call is its own *trace* unless
+it happens inside a span you opened: wrap the call in `@mlflow.trace` and every question's span — one per SDK
+call, so a fallback costs more than one — hangs under that one parent. MLflow's active run is thread-local
+rather than a context variable, so a run started with `mlflow.start_run()` is not attached to spans created on
+the client's worker threads; `@mlflow.trace` is the way to get one trace per call.
 
 | jevper surface | Span name |
 | --- | --- |
@@ -198,22 +202,29 @@ you wrap it in `@mlflow.trace`, and each question's span hangs under it.
 | `api="messages"` | `Messages.create` (`AsyncMessages.create` async) |
 
 On a span: `mlflow.spanInputs`/`mlflow.spanOutputs` hold the kwargs jevper built and the raw provider
-response, `mlflow.chat.tokenUsage` the token counts (absent entirely when the provider sent no usage at
-all, null-valued when it sent one with fields missing), `mlflow.llm.model` the model, `mlflow.llm.provider`
-`anthropic` on the Messages route, `mlflow.message.format` `openai` or `anthropic`, and
-`mlflow.spanLogLevel` `20` for a call that returned, `40` for one that raised. The status follows the *SDK
+response (MLflow also promotes some request fields to span attributes, and which ones depends on the route),
+`mlflow.chat.tokenUsage` the token counts `{"input_tokens", "output_tokens", "total_tokens"}` plus
+`cache_read_input_tokens` on Responses — absent entirely when the provider sent no `usage` at all, `null` per
+token when it sent one with those fields missing — `mlflow.llm.model` the model, `mlflow.llm.provider`
+`anthropic` on the Messages route and absent on the OpenAI ones, `mlflow.message.format` `openai` or
+`anthropic`, and `mlflow.spanLogLevel` `20` for a call that returned, `40` for one that raised, `10` for a
+plain `@mlflow.trace` span of your own. The status follows the *SDK
 call*, not jevper's reading of the answer: a refusal or a spent budget arrives as an HTTP `200`, so the span
-is `OK` while jevper raises `MalformedAnswerError` — the span says what the provider said, the error says
-whether an answer came out. A duck-typed client of your own is invisible to autolog; wrap it in
-`@mlflow.trace` yourself. `mlflow.tracing.disable()` stops recording, an unwritable tracking store does not
-break the call, and `mlflow.flush_trace_async_logging()` forces the asynchronous export out.
+is `OK` while jevper raises `MalformedAnswerError` or `LabelReadoutError` — and a 200 the SDK itself cannot
+parse is an error span, while one it tolerates and jevper then trips over is not. The span says what the
+provider said, the error says whether an answer came out. A duck-typed client of your own is invisible to
+autolog; wrap it in `@mlflow.trace` yourself. `mlflow.tracing.disable()` stops recording, an unwritable
+tracking store does not break the call, and `mlflow.flush_trace_async_logging()` forces the export out.
 
-Hosting jevper as a model is the other half: subclass `mlflow.pyfunc.ResponsesAgent` (recommended since
-MLflow 3.0) or the deprecated `ChatModel`, build the client in `load_context` — a pickled instance cannot
-carry one — and log it with `python_model="<path>"`. `log_model` runs your `input_example` through the model
-while logging, so an integration that cannot answer its own example fails there, not later. The standalone
-`mlflow gateway start` is deprecated in favour of the server-hosted gateway. Full detail, verified against
-MLflow 3.16.1, is the library's `docs/mlflow.md`; the extra is `pip install 'mlflow[gateway,langchain]>=3.16'`.
+Hosting jevper as a model is the other half: MLflow 3.16.1 offers `mlflow.pyfunc.PythonModel` (current),
+`ResponsesAgent` (recommended for new code) and the `ChatModel` deprecated since 3.0.0 — `ChatAgent` also
+exists, for agents rather than chat. The pyfunc fixtures build the client in `load_context` — a cloudpickled
+instance cannot carry one — and log the code with `python_model="<path>"`; the LangChain flavour is a
+picklable `SimpleChatModel` that takes its `base_url` and `model` from the `model_config` logged beside it.
+`log_model` runs your `input_example` through the model while logging, so an integration that cannot answer
+its own example fails there, not later. The standalone `mlflow gateway start` is deprecated in favour of
+the server-hosted gateway. Full detail, verified against MLflow 3.16.1, is the library's `docs/mlflow.md`;
+the extra is `pip install 'mlflow[gateway,langchain]>=3.16'`.
 
 ## Client knobs
 
@@ -221,19 +232,19 @@ MLflow 3.16.1, is the library's `docs/mlflow.md`; the extra is `pip install 'mlf
 | --- | --- | --- |
 | `method` | `"auto"` | you have a reason (see SKILL.md) |
 | `api` | `"auto"` (prefers Responses, then Chat Completions, then Messages) | a client exposes several surfaces and you want a specific one |
-| `temperature` | `None` (not sent) | `0.0` for `structured`/`discrete`; leave unset for `logprobs` |
-| `top_logprobs` | `20` | lower it only if the provider rejects the field; a pinned `logprobs`/`grammar` needs at least 2, since one logprob is not a distribution. A provider whose cap is lower refuses the *value* (`Invalid 'top_logprobs': integer must be between 0 and 5`), which falls back for that question without writing logprobs off for good |
+| `top_logprobs` | `20` | an integer, at most 20; lower it only if the provider rejects the field. A pinned `logprobs`/`grammar` needs at least 2, since one logprob is not a distribution. A provider whose cap is lower refuses the *value* (`Invalid 'top_logprobs': integer must be between 0 and 5`), which falls back for that question without writing logprobs off for good. The `[0, 20]` range the library documents is enforced from above only: under `auto` a negative value is not refused and reaches the provider, so keep it at 0 or more yourself |
 | `structured_outputs` | `True` | `False` sends `{"type": "json_object"}` instead of a strict schema, and the schema then travels in the system prompt — for providers that reject strict schemas; a server that refuses the format field outright then skips that rung and is re-asked without one |
 | `prompt_cache_key` | `None` (derived per question) | route one rubric's calls to a shared cache, or keep tenants apart; non-blank, at most 256 characters |
-| `normalize_probabilities` | `True` | `False` returns the model's `structured` numbers verbatim (the error is still recorded in `debug`) |
+| `normalize_probabilities` | `True` | `False` returns the model's `structured` numbers verbatim — the provider's own values, a mass above 1 included, with the error still recorded in `debug`; a negative or non-finite value is a `MalformedAnswerError` either way |
 | `max_concurrency` | `8` | your provider rate-limits per key |
 | `n_retry_malformed` | `1` | a model that keeps answering in prose |
 | `retry` | `RetryPolicy()` | transient-failure retries: `n_retries=2`, `base_delay=0.5`, `max_delay=8.0` |
-| `extra_body`, `extra_headers` | `None` | provider-specific fields — including `max_tokens` on the Messages surface, where jevper's `1024` default may be too small. A key named here is what reaches the wire (the SDK merges `extra_body` last), so it also wins over jevper's own value for that field |
+| `extra_body`, `extra_headers` | `None` | provider-specific fields — including `max_tokens` on the Messages surface, where jevper's `1024` default may be too small. A key named here is what reaches the wire (the SDK merges `extra_body` last), so it also wins over jevper's own value for that field. On the Messages surface in 0.5.3 that body is attached only when a `temperature` is set *and* jevper's own thinking is off, so a key you rely on there (the local servers' `chat_template_kwargs`) needs `temperature=0.0` beside it; `max_tokens` is read out of it either way |
 
-Constructor misuse (unknown `method`/`api`, `top_logprobs` outside `[0, 20]`, a pinned label method below
-2, `max_concurrency < 1`, a negative retry field, a blank or over-long `prompt_cache_key`) raises
-`JevperError` immediately, so a typo never reaches a provider — and so does a per-call `api=""`/`method=""`,
+Constructor misuse (unknown `method`/`api`, a count option that is not an integer, `top_logprobs` above 20,
+a pinned label method below 2, `max_concurrency < 1`, a negative retry field, a blank or over-long
+`prompt_cache_key`, a `model` that is not a non-blank string) raises `JevperError` immediately, so a typo
+never reaches a provider — and so does a per-call `api=""`/`method=""` or `model=""`,
 since an override is only used when it is not `None`. `ReasoningConfig` is a pydantic model, so its
 own validation (`effort`, `budget_tokens`, `mode`) raises `pydantic.ValidationError` at the point you build
 it, not from the client; `budget_tokens` stays validated if you assign to it afterwards.

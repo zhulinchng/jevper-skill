@@ -46,15 +46,18 @@ Scenarios:
 Knobs: ``surface`` (``chat_completions``, ``responses``, ``messages`` or ``both``, default ``both`` — the
 endpoints this client exposes, as ``openai.OpenAI`` exposes the first two and ``anthropic.Anthropic`` the
 third), ``winner`` (index into the label alphabet of the option the stub prefers), ``alternatives`` (labels
-reported alongside the answer; 1 means "no distribution") and ``cached_tokens`` (what the server reports as
-read from its prompt cache; ``None`` models a server that says nothing about it). ``requests`` records what
+reported alongside the answer; 1 means "no distribution"), ``cached_tokens`` (what the server reports as
+read from its prompt cache; ``None`` models a server that says nothing about it) and ``self_reported`` (the
+probabilities a model states itself, replacing the stub's own distribution — a model whose JSON does not add
+up to 1, which is what ``normalize_probabilities=False`` hands back verbatim). ``requests`` records what
 each call put on the wire — the kwargs with ``extra_body`` merged in, as the SDK merges it — and
 ``surfaces`` the endpoint each one went to, in the same order.
 
 Self-test with ``python offline_stub.py --check``; probe a real provider with
-``python offline_stub.py --live --model <id>``. The live probe first asks the server what the model
-advertises — OpenRouter's ``/models`` and ``/models/<id>/endpoints`` cost no quota — then spends one call,
-and reports a quota, credit or key failure as what it is rather than as a jevper failure.
+``python offline_stub.py --live --model <id>`` (add ``--extra-body '{...}'`` for request fields, e.g. the
+``chat_template_kwargs`` that turns thinking off on a local server). The live probe first asks the server
+what the model advertises — OpenRouter's ``/models`` and ``/models/<id>/endpoints`` cost no quota — then
+spends one call, and reports a quota, credit or key failure as what it is rather than as a jevper failure.
 """
 
 from __future__ import annotations
@@ -329,6 +332,7 @@ class StubClient:
         winner: int = 0,
         alternatives: int | None = None,
         cached_tokens: int | None = CACHED_TOKENS,
+        self_reported: dict[str, float] | None = None,
     ) -> None:
         if scenario not in SCENARIOS:
             raise ValueError(f"scenario must be one of {SCENARIOS}, got {scenario!r}")
@@ -339,6 +343,7 @@ class StubClient:
         self.winner = winner
         self.alternatives = alternatives
         self.cached_tokens = cached_tokens
+        self.self_reported = self_reported
         self.requests: list[dict[str, Any]] = []
         self.surfaces: list[str] = []
         if surface in ("chat_completions", "both"):
@@ -444,6 +449,8 @@ class StubClient:
 
         answer = _schema_answer(schema, self.winner) if schema is not None else None
         if answer is not None:
+            if self.self_reported is not None and "probabilities" in answer:
+                answer = {**answer, "probabilities": dict(self.self_reported)}
             return body(kwargs, body=answer, cached=self.cached_tokens)
         return body(kwargs, text="A", cached=self.cached_tokens)  # a request jevper reads no answer out of
 
@@ -507,6 +514,81 @@ def _run_checks() -> int:
     check("structured: the distribution sums to 1", abs(sum(answer.probabilities.values()) - 1.0) < 1e-9)
     check("structured: no normalization warning on a clean answer",
           response.debug["probability_errors"] == {}, str(response.debug["probability_errors"]))
+
+    # A model that states its own numbers and gets them wrong: normalization rescales, and turning
+    # it off hands them back as they arrived — a value above 1 included, which is what the answer
+    # type now allows. A negative one never gets that far: the readout calls it malformed.
+    off_sum = {"billing": 1.4, "technical": 0.2, "sales": 0.2}
+    stub = StubClient(scenario="structured", surface="chat_completions", self_reported=off_sum)
+    response = SystemOneClient(stub, model="stub-model", method="structured").system_one(
+        state=state, questions={"intent": question()}
+    )
+    answer = response.answers["intent"]
+    check("self-reported: normalization rescales a distribution that misses 1",
+          abs(sum(answer.probabilities.values()) - 1.0) < 1e-9
+          and response.debug["original_probabilities"]["intent"] == off_sum
+          and response.debug["probability_errors"]["intent"] > 0.7,
+          str(answer.probabilities))
+
+    stub = StubClient(scenario="structured", surface="chat_completions", self_reported=off_sum)
+    response = SystemOneClient(
+        stub, model="stub-model", method="structured", normalize_probabilities=False
+    ).system_one(state=state, questions={"intent": question()})
+    answer = response.answers["intent"]
+    check("self-reported: normalize_probabilities=False hands the numbers back untouched",
+          answer.probabilities == off_sum and answer.choice == "billing"
+          and response.debug["probability_errors"]["intent"] > 0.7,
+          str(answer.probabilities))
+
+    stub = StubClient(
+        scenario="structured", surface="chat_completions",
+        self_reported={"billing": 1.4, "technical": -0.1, "sales": 0.1},
+    )
+    try:
+        SystemOneClient(
+            stub, model="stub-model", method="structured", normalize_probabilities=False
+        ).system_one(state=state, questions={"intent": question()})
+    except MalformedAnswerError as exc:
+        check("self-reported: a negative probability is malformed whatever the knob says",
+              "must be >= 0" in str(exc), str(exc))
+    else:  # pragma: no cover
+        check("self-reported: a negative probability is malformed whatever the knob says",
+              False, "no error")
+
+    # Count options and the model id are the client's own inputs, so a slip in either is a local
+    # failure: nothing is sent, and the message says which one was wrong.
+    stub = StubClient()
+    for name, options in (
+        ("top_logprobs=2.5", {"top_logprobs": 2.5}),
+        ("max_concurrency=1.0", {"max_concurrency": 1.0}),
+        ("n_retry_malformed=0.5", {"n_retry_malformed": 0.5}),
+    ):
+        try:
+            SystemOneClient(stub, model="stub-model", **options)
+        except JevperError as exc:
+            check(f"validation: {name} is refused as a non-integer", "must be an integer" in str(exc), str(exc))
+        else:  # pragma: no cover
+            check(f"validation: {name} is refused as a non-integer", False, "no error")
+    check("validation: a refused count option sends nothing", not stub.requests, str(stub.requests))
+
+    stub = StubClient()
+    try:
+        SystemOneClient(stub, model="  ")
+    except JevperError as exc:
+        blank = "non-empty string" in str(exc)
+    else:  # pragma: no cover
+        blank = False
+    try:
+        SystemOneClient(stub, model="stub-model").system_one(
+            state=state, questions={"intent": question()}, model=""
+        )
+    except JevperError as exc:
+        override = "non-empty string" in str(exc)
+    else:  # pragma: no cover
+        override = False
+    check("validation: a blank model is refused at construction and as a per-call override",
+          blank and override and not stub.requests,
+          f"blank={blank} override={override} requests={len(stub.requests)}")
 
     # A provider that rejects the logprob fields on both surfaces: auto falls back, and remembers.
     stub = StubClient(scenario="reject_logprobs")
@@ -902,16 +984,20 @@ def _run_checks() -> int:
     check("messages: a caller's max_tokens in extra_body still wins outright",
           stub.requests[0].get("max_tokens") == 4096, str(stub.requests[0].get("max_tokens")))
 
+    # A caller who names a capability field owns it: their value is what reaches the wire, jevper
+    # sends no typed copy beside it, and a refusal drops both — the re-ask carries neither.
     stub = StubClient(scenario="reject_thinking", surface="messages")
     response = SystemOneClient(
         stub,
         model="stub-model",
         method="structured",
+        temperature=0.0,
         reasoning=ReasoningConfig(mode="native", budget_tokens=1024),
         extra_body={"thinking": {"type": "enabled", "budget_tokens": 512}},
     ).system_one(state=state, questions={"intent": question()})
-    check("reject_thinking: the caller's own copy of the field is dropped with jevper's",
-          response.debug["server_limits"]["thinking"] is False
+    check("reject_thinking: the caller's own copy is what is sent, and dropped with jevper's",
+          stub.requests[0].get("thinking") == {"type": "enabled", "budget_tokens": 512}
+          and response.debug["server_limits"]["thinking"] is False
           and len(stub.requests) == 2 and stub.requests[1].get("thinking") is None,
           str([request.get("thinking") for request in stub.requests]))
 
@@ -1021,6 +1107,12 @@ def _run_checks() -> int:
     local = _live_failure(JevperError("prompt_cache_key must be a non-blank string"))
     check("live probe: a local refusal names no status and points at the triage table",
           "HTTP" not in local and "troubleshooting.md" in local, local)
+    unread = _live_failure(MalformedAnswerError("no JSON object in the answer — reasoning only"))
+    check("live probe: an answer that could not be read is told from one that never arrived",
+          "HTTP" not in unread and "the provider answered" in unread, unread)
+    check("live probe: --extra-body is refused unless it is a JSON object",
+          main(["--live", "--model", "m", "--extra-body", "{oops"]) == 2
+          and main(["--live", "--model", "m", "--extra-body", "[1]"]) == 2)
 
     print()
     print(f"{'all checks passed' if not failures else f'{failures} check(s) failed'}")
@@ -1039,6 +1131,34 @@ _LIVE_REMEDIES = {
     429: "the key or IP is rate-limited, or the account's free-model quota is spent: a quota answer, not a "
          "jevper failure. Retry later, or probe a model that still has quota",
 }
+
+# A provider that answered and jevper could not read the answer is a different failure from one that
+# never answered, and the two want opposite next steps: the first is about the answer, the second
+# about the request. Naming the class is what tells them apart.
+_LIVE_ANSWER_REMEDIES = {
+    "MalformedAnswerError": "the provider answered, but the answer could not be read — a reasoning model "
+                            "that spent the output budget, a refusal, or a shape the prompt did not pin "
+                            "down; turn thinking off and see troubleshooting.md",
+    "LabelReadoutError": "the provider answered, but not with a distribution — turn thinking off, or let "
+                         "`auto` answer with `structured` (troubleshooting.md)",
+    "UnsupportedMethodError": "that method does not exist on this surface — leave the method unset, or "
+                              "pass --api chat_completions",
+    "ClientCapabilityError": "the client cannot speak the surface jevper chose — pass --api explicitly",
+    "InvalidQuestionError": "the question is the problem, not the provider — check the criteria and the method",
+}
+
+
+def _live_remedy(exc: Exception, status: Any) -> str | None:
+    """What to do about this failure: the status first, then the kind of error, then the input."""
+    if status:
+        return _LIVE_REMEDIES.get(status) or (
+            "the provider is failing — retry, or check the model and provider status"
+            if 500 <= status < 600 else None
+        )
+    return _LIVE_ANSWER_REMEDIES.get(type(exc).__name__) or (
+        "the request never reached a provider: jevper refused the input, or the client cannot reach the "
+        "server — see troubleshooting.md"
+    )
 
 
 def _capabilities(parameters: set[str]) -> dict[str, Any]:
@@ -1096,16 +1216,13 @@ def _live_failure(exc: Exception) -> str:
         lines.append(f"  provider attempts: {len(attempts)}")
     if said:
         lines.append(f"  provider says: {said}")
-    remedy = _LIVE_REMEDIES.get(status) if status else None
-    if remedy is None and status and 500 <= status < 600:
-        remedy = "the provider is failing — retry, or check the model and provider status"
-    lines.append(f"  next: {remedy or 'no request reached a provider, or none came back — see troubleshooting.md'}")
+    remedy = _live_remedy(exc, status)
+    lines.append(f"  next: {remedy}")
     return "\n".join(lines)
 
 
-def _run_live(model: str, api: str) -> int:
+def _run_live(model: str, api: str, extra_body: dict[str, Any] | None = None) -> int:
     if api == "messages":
-        # The Anthropic SDK speaks this one; a local server takes any key, so only the base URL matters.
         try:
             from anthropic import Anthropic
         except ImportError:
@@ -1144,7 +1261,7 @@ def _run_live(model: str, api: str) -> int:
         if preflight is not None:  # to stderr, so stdout stays the JSON result
             print(f"preflight  {model}: logprobs={'yes' if preflight['logprobs'] else 'no'}, "
                   f"schema={preflight['schema']}", file=sys.stderr)
-    client = SystemOneClient(probe_client, model=model, api=api)
+    client = SystemOneClient(probe_client, model=model, api=api, extra_body=extra_body)
     try:
         response = client.system_one(
             state="I was charged twice for the same subscription this month.", questions={"intent": question}
@@ -1176,13 +1293,28 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--live", action="store_true", help="ask a real provider which method it resolves to")
     parser.add_argument("--model", default=os.environ.get("LLM_MODEL", ""), help="model id for --live")
     parser.add_argument("--api", default="auto", choices=("auto", "chat_completions", "responses", "messages"))
+    parser.add_argument(
+        "--extra-body", default=None, metavar="JSON",
+        help='request fields merged into every call, e.g. \'{"chat_template_kwargs": '
+             '{"enable_thinking": false}}\' to turn thinking off on a local server',
+    )
     args = parser.parse_args(argv)
 
     if args.live:
         if not args.model:
             print("--live needs --model <id> (or LLM_MODEL)")
             return 2
-        return _run_live(args.model, args.api)
+        extra_body = None
+        if args.extra_body is not None:
+            try:
+                extra_body = json.loads(args.extra_body)
+            except ValueError as exc:
+                print(f"--extra-body needs a JSON object: {exc}")
+                return 2
+            if not isinstance(extra_body, dict):
+                print(f"--extra-body needs a JSON object, got {type(extra_body).__name__}")
+                return 2
+        return _run_live(args.model, args.api, extra_body)
     if args.check:
         return _run_checks()
     parser.print_help()

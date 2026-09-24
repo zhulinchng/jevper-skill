@@ -13,7 +13,7 @@ hosted models and self-hosted llama.cpp/vLLM/Ollama/SGLang servers work the same
 rendered last so a rubric's prompts share a cacheable prefix. `openai` and `anthropic` are not runtime
 dependencies; `pydantic>=2.7` is. Python 3.10+.
 
-Written against jevper 0.5.2; if you are on a newer release, check its `docs/` — the library is the
+Written against jevper 0.5.3; if you are on a newer release, check its `docs/` — the library is the
 authority.
 
 ## Quick start
@@ -190,14 +190,17 @@ Three groups, and only the middle one is worth catching for control flow:
 | `ProviderError` | a provider call failed after transient retries; `.attempts` and `.status_code` hold the history, including a status carried inside a `200` body (OpenRouter), and it is also what you get when no surface the client can speak has the route — a missing route is the provider's failure, not a verdict jevper keeps | the only one worth a retry loop of your own, and the one to catch at a service boundary |
 
 `JevperError` is the base class — catch it if you want one handler for everything, including constructor
-misuse, a bad `state` message, and content that is not JSON-serializable or carries a non-finite number.
+misuse (a count option that is not an integer, a blank `model`, an unknown `method`/`api`), a bad `state`
+message, and content that is not JSON-serializable or carries a non-finite number.
 Transient failures (`408`, `429`, `500`, `502`, `503`, `504`, `529`, connection and timeout errors, httpx
 transport errors) are retried per call with `RetryPolicy(n_retries=2, base_delay=0.5, max_delay=8.0)`, at
 `min(base_delay · 3ⁿ, max_delay)`; a `Retry-After` header is not read.
 
 MLflow traces the same story without jevper's help: `mlflow.openai.autolog()` and `mlflow.anthropic.autolog()`
-patch the SDK, so every request jevper made — the ones it settled away from included — is a span under your
-own `@mlflow.trace` one. [references/features.md](references/features.md#tracing-with-mlflow).
+patch SDK resource classes, so every call through a real OpenAI/Anthropic SDK client — rejected, retried and
+fallback attempts included — is a span, and wrapping the jevper call in `@mlflow.trace` groups them under one
+parent; a duck-typed client is not autologged.
+[references/features.md](references/features.md#tracing-with-mlflow).
 
 A server that refuses a field jevper added for capability does not fail the call: `response_format` (or
 `text.format`) walks `json_schema` → `json_object` → nothing, then the reasoning parameters, then the
@@ -221,15 +224,19 @@ Three traps worth knowing:
 - **`structured` probabilities are the model's self-report.** They are rescaled when they miss 1 by more
   than `1e-6`, and the model's original numbers are kept in `debug["original_probabilities"]` (with the
   error in `debug["probability_errors"]`). Set `temperature=0.0` there; sampling noise moves them directly.
+  With `normalize_probabilities=False` they are handed back exactly as the provider sent them, a value
+  above 1 included (a negative or non-finite one is still a malformed answer) — normalize them yourself
+  if your code assumes a distribution.
 - **An answer that never arrived says why.** A reasoning model can spend the whole output budget thinking,
   and the error text then names the stop reason (`finish_reason: 'length'` /
   `incomplete_details.reason: 'max_output_tokens'` / `stop_reason: 'max_tokens'`) and suggests
   `extra_body={"max_tokens": ...}` — nobody sends those caps, so raise it and turn thinking off too. A
-  model that *refused* reads as a refusal rather than as malformed JSON: OpenAI reports it in a `refusal`
-  sibling of a null `content`, the Messages API as `stop_reason: 'refusal'`, and the message carries the
-  model's own words where the surface has them. When a reasoning parser swallowed the whole generation into
-  a thinking block and returned no answer text, the same error says the response carried reasoning only: a
-  server-side deployment setting, not something another retry fixes.
+  model that *refused* reads as a refusal rather than as malformed JSON: Chat Completions puts it in a
+  `refusal` sibling of a null `content`, Responses in a `refusal` content part, the Messages API in
+  `stop_reason: 'refusal'`, and the message carries the model's own words where the surface has them. When
+  the reasoning parser swallowed the whole generation into a thinking block and returned no answer text, the
+  same error says the response carried reasoning only: a server-side deployment setting, not something
+  another retry fixes.
 
 ## Test without spending tokens
 
@@ -259,10 +266,12 @@ Scenarios: `logprobs`, `structured`, `reject_logprobs`, `reject_include`, `no_al
 `reject_thinking`, `reject_budget_value`, `truncated`, `refusal`, `reasoning`, `reasoning_only`. Run
 `python scripts/offline_stub.py --check` from the skill directory for a self-test, and
 `python scripts/offline_stub.py --live --model <id>` (add `--api messages` for an Anthropic-compatible
-server) with real credentials to see which method that provider actually resolves to, on which surface,
-before writing a line of your own. The live probe asks the server what the model advertises first — free,
-outside any request quota — and a `429`, `402` or `401` is reported as the account answer it is, not as a
-jevper failure. [references/providers.md](references/providers.md#does-this-provider-do-logprobs) has the
+server, `--extra-body '{"chat_template_kwargs": {"enable_thinking": false}}'` for a local server whose
+template thinks) with real credentials to see which method that provider actually resolves to, on which
+surface, before writing a line of your own. The live probe asks the server what the model advertises first —
+free, outside any request quota — and a `429`, `402` or `401` is reported as the account answer it is, not as
+a jevper failure.
+[references/providers.md](references/providers.md#does-this-provider-do-logprobs) has the
 matrix and what each quota means.
 
 ## Checklist

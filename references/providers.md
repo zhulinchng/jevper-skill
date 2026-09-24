@@ -8,14 +8,14 @@
 
 ## Does this provider do logprobs?
 
-Observed against each provider's live API, as of jevper 0.5.2 — providers move, so treat a row as a
+Observed against each provider's live API, as of jevper 0.5.3 — providers move, so treat a row as a
 starting point rather than a law, and let `auto` verify it per `(model, surface)` for you.
 
 | Provider | `logprobs` | Note |
 | --- | --- | --- |
 | OpenAI `gpt-4o`, `gpt-4.1` | yes | |
 | OpenAI reasoning models (`o`-series, `gpt-5` family) | no | `400 logprobs are not supported with reasoning models.` |
-| OpenAI Responses surface | partial | `include` returns the sampled token and no alternatives; some models fail outright on `top_logprobs >= 2` |
+| OpenAI Responses surface | partial | `include` returns the sampled token and no alternatives; a model with no includable logprobs refuses the list outright (`400 Unsupported parameter: 'include' is not supported with this model.`) — the refusal counts, because on this surface `include` is the carrier, while a Chat Completions error merely *mentioning* `include` is about something else |
 | Anthropic Claude | no | no logprob API at all |
 | Gemini via the OpenAI-compatibility endpoint | no | `400 Unknown name "logprobs": Cannot find field.` |
 | Gemini native API | yes | not reachable through an OpenAI-compatible client |
@@ -45,6 +45,14 @@ OpenRouter's per-provider `GET {base_url}/models/<id>/endpoints`, neither of whi
 quota — and prints `preflight` (logprobs? a strict schema? a plain `json_object`? neither?). A model
 advertising no logprob field is read with `structured`; one advertising no format field also loses the
 schema, and the shape then rests on the prompt alone.
+
+Local servers publish no such metadata, so the probe prints `preflight: null` against them and spends its one
+call; that is the unknown case, not a failure. What they do need is in the request, and `--extra-body` is how
+the probe carries it — against a server whose template thinks, pass
+`--extra-body '{"chat_template_kwargs": {"enable_thinking": false}}'` (vLLM, SGLang, llama.cpp) or
+`--extra-body '{"reasoning_effort": "none"}'` (ollama), or the first token the label readout sees is the
+reasoning rather than the label. A failure is one screen: the error class, the status if there was one, the
+provider's own words truncated, and what to do about it.
 
 A quota, credit or key refusal is reported as what it is — the status, the provider's own words (truncated),
 and the next step — because it is not a jevper failure. On OpenRouter that means: `free-models-per-day` is
@@ -112,22 +120,26 @@ is needed to answer the question.
 
 ## Local servers
 
-A local server is the same client with a different `base_url`. Checked against ollama 0.34, llama.cpp
-b11139, vLLM 0.30 and SGLang 0.5.20 serving `Qwen3.5-9B` at 4-bit on one 12 GB card, and LM Studio 0.4.1.
+A local server is the same client with a different `base_url`. Checked on one 12 GB card against ollama
+0.34.3 and llama.cpp serving `Qwen3.5-9B-Q4_K_M`, vLLM 0.30.1 and SGLang 0.5.20 serving
+`Qwen3.5-9B-AWQ-4bit`, and LM Studio's `llmster` 0.0.25 serving `Qwen3-4B-Instruct-2507`.
 
 | Server | `base_url` | `model` | Thinking off | Notes |
 | --- | --- | --- | --- | --- |
 | ollama | `http://127.0.0.1:11434/v1` | the tag you pulled | `extra_body={"reasoning_effort": "none"}` | Chat Completions carries logprobs; the Responses route returns an empty logprob list |
-| llama.cpp | `http://127.0.0.1:8080/v1` | the `--alias` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--jinja`; the only server that honours `grammar` |
+| llama.cpp | `http://127.0.0.1:8080/v1` | the `--alias` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--jinja`; the only server that honours `grammar`. Its Responses route accepts `text.format` and ignores it, while Chat Completions turns the schema into an enforced grammar — structured work belongs on Chat |
 | vLLM | `http://127.0.0.1:8000/v1` | the `--served-model-name` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--reasoning-parser qwen3`; `top_logprobs` capped by `--max-logprobs` (20) |
 | SGLang | `http://127.0.0.1:30000/v1` | the `--served-model-name` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--reasoning-parser qwen3`; its Responses route needs `top_logprobs`, which jevper always sends |
-| LM Studio | `http://127.0.0.1:1234/v1` | the id `lms ls` prints | nothing reliably — load an instruct model | the only one here answering all three surfaces, so `auto` finds Responses, Chat Completions and Messages on one box; logprobs arrive on both OpenAI surfaces, but its Responses route ignores the schema, so structured answers belong on Chat Completions |
+| LM Studio | `http://127.0.0.1:1234/v1` | the id `lms ls` prints | nothing reliably — load an instruct model | all three surfaces on one box, as on the other four; logprobs arrive on both OpenAI surfaces, but its Responses route ignores the schema, so structured answers belong on Chat Completions |
 
 `api="auto"` works against all five: it prefers Responses, and when that route is missing or answers
 without a distribution it re-asks on Chat Completions and remembers the verdict. `api="chat_completions"`
-skips the discovery entirely.
+skips the discovery entirely. All five also answer the Anthropic Messages route, so `auto` has three
+surfaces to choose from on any of them; ollama, llama.cpp, SGLang and LM Studio were exercised through it
+directly, and vLLM answers `200` with a thinking block and **no text** for a Qwen3-4B model — jevper reports
+an empty answer naming the stop reason, and the cause is the server's template, so use its OpenAI surfaces.
 
-**Thinking is the one decision you must make.** `logprobs`, `grammar` and `discrete` read a one-token
+**Thinking is the one decision you must make.** `logprobs` and `grammar` read a one-token
 answer, and every one of these servers reports logprobs for *every* generated token — with thinking on,
 that is the first token of the reasoning, not the label, and the readout raises `LabelReadoutError`. Turn
 it off for classification work: it costs a whole reasoning pass to choose one letter. Llama.cpp also
@@ -150,6 +162,9 @@ and the silent ones:
   its own enum and answers `400` for a value outside it (`xhigh` and `max` are the usual casualties).
 - `strict: true` is ignored by ollama, honoured by vLLM and SGLang.
 - `max_completion_tokens` is ignored by ollama, which only knows `max_tokens`.
+- A small-context model refuses before inference: vLLM answers
+  `400 max_tokens=2048 cannot be greater than max_model_len=max_total_tokens=1024`. jevper forwards that
+  400 with the numbers in it; bound the output yourself with `extra_body={"max_tokens": n}`.
 - `n` is rejected outright by llama.cpp (`1 <= value <= 1`); vLLM and SGLang accept it and return two
   choices, where jevper reads the first.
 - A `developer`-role message is a `400` (`Unexpected message role.`) on SGLang. jevper's own turns never
@@ -182,10 +197,10 @@ skin (`ANTHROPIC_BASE_URL=https://openrouter.ai/api`, documented by OpenRouter r
 | Server | Since | `thinking` field | Thinking blocks back | `usage` cache counts |
 | --- | --- | --- | --- | --- |
 | LM Studio | 0.4.1 | accepted, answer still separated from it | `thinking` blocks when the model thinks | `cache_read_input_tokens`, including a reported `0` on a cold call |
-| llama.cpp | b7187 | accepted, and the budget grows `max_tokens` as below | reported | not documented |
+| llama.cpp | b7187 | accepted, and the budget grows `max_tokens` as below | reported | yes (`cache_read_input_tokens`, measured) |
 | vLLM | 0.11.1 | **accepted and ignored**: its request model has no `thinking` field and pydantic drops the extra, so no downgrade fires and the answer comes back with no thinking and no way to tell | `thinking` blocks | yes |
 | SGLang | 0.5.9 | **refused**: this version has no `thinking` field at all, so the request is answered `400` and jevper drops the field and re-asks | `thinking` blocks | yes |
-| ollama | 0.14.0 | accepted, but `budget_tokens` is **not enforced** | `thinking` blocks | no cache fields at all |
+| ollama | 0.14.0 | accepted, but `budget_tokens` is **not enforced** | `thinking` blocks | yes (`cache_read_input_tokens`, measured; the Chat route reports nothing) |
 
 Four protocol facts shape what the client does on this surface:
 
@@ -197,12 +212,16 @@ Four protocol facts shape what the client does on this surface:
 - **`max_tokens` is required** by vLLM's and SGLang's implementations and has no default on any of them, so
   jevper always sends one: `1024`, or `1024` plus the caller's `ReasoningConfig(budget_tokens=n)`, because
   this API also requires the thinking budget to be strictly *below* `max_tokens` and would refuse the 1024
-  its own documentation calls the floor. `extra_body={"max_tokens": n}` wins outright. Measured on all five:
+  its own documentation calls the floor. `extra_body={"max_tokens": n}` wins outright, and a value too small
+  to hold the budget raises `JevperError` locally, naming both numbers. Measured on all five:
   a 1024 budget sends `max_tokens: 2048`, a 2048 budget sends `3072`. Thinking is a budget, not an effort
   name: `ReasoningConfig(budget_tokens=n)` sends `thinking={"type": "enabled", ...}` and `effort` is never
   translated into one. A server that refuses the *value* (`budget_tokens: must be at least 1024`) keeps its
   own error rather than being re-asked with your reasoning silently switched off; one that does not know the
   field at all has it dropped and the call re-asked, reported in `debug["server_limits"]["thinking"]`.
+- **`temperature` is left out of a Messages request that enables `thinking`** — the API refuses a
+  non-default temperature beside thinking, so jevper omits it there. Set it on the OpenAI surfaces, or turn
+  thinking off, if you were counting on it.
 - **A `system` role inside `messages` is not part of the API** — Anthropic has since added mid-conversation
   `system` messages, but none of these servers implements them, rendering a `system` turn positionally into
   the chat template instead — so jevper moves it to the top-level `system` field, where it cannot be dropped
@@ -213,7 +232,9 @@ The reasoning parsers matter here too. With thinking left on — vLLM's and SGLa
 the parser can put the whole generation into a thinking block and return no text block at all, so there is
 nothing to read: a `structured` call raises `MalformedAnswerError`, whose message says the response carried
 reasoning only. Turn thinking off per call exactly as on the other surfaces
-(`extra_body={"chat_template_kwargs": {"enable_thinking": False}}`); with that, every scenario on vLLM's
+(`extra_body={"chat_template_kwargs": {"enable_thinking": False}}`) — but on this surface in 0.5.3 that body
+only reaches the wire when a `temperature` is set and jevper's own thinking is off, so pass `temperature=0.0`
+beside it or the knob is silently dropped; with that, every scenario on vLLM's
 Messages route answers. SGLang needs one more server-side decision: with `--reasoning-parser qwen3` and a
 *non-thinking* model, whose template has no `enable_thinking` to set, the parser never sees the closing
 marker it waits for and classifies the whole generation as reasoning — dropping `--reasoning-parser` fixes
@@ -232,10 +253,11 @@ what they disagree on is telling you it happened.
 | --- | --- | --- | --- | --- |
 | `usage.prompt_tokens_details.cached_tokens` (Chat) | always | always | needs `--enable-prompt-tokens-details` | needs `--enable-cache-report` |
 | `usage.input_tokens_details.cached_tokens` (Responses) | always | always | always | always |
-| `usage.cache_read_input_tokens` (Messages) | no such field | not documented | yes | yes |
+| `usage.cache_read_input_tokens` (Messages) | yes | yes | yes | yes |
 
-jevper reads all three paths into `usage.cached_tokens` and leaves it `None` when the server says nothing —
-which is why the flag matters if you want the number on vLLM or SGLang. A reported `0` is a cold or
+jevper reads all three paths into `usage.cached_tokens` and leaves it `None` when the server says nothing.
+The Messages route is reported by all four, so the flags that decide whether you get a number are the Chat
+Completions ones — a server that says nothing is not the same as one that reported `0`, which is a cold or
 disabled cache and is preserved as `0`. A server that refuses the `prompt_cache_key` field has it dropped
 and the call re-asked (`debug["server_limits"]["cache_key"] is False`); on all five local servers the field
 is accepted with `200` and ignored. LM Studio reports per route rather than per server: Chat Completions
