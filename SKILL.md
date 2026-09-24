@@ -1,6 +1,6 @@
 ---
 name: jevper
-description: Writes and debugs Python code that calls jevper — the Jev (System One) interface that turns a state plus Noul/Choice/Score questions into typed answers with probabilities and confidence, over any OpenAI-compatible model. Use whenever the user mentions jevper, the Jev or System One API, TypeSafe-style classification, or wants an LLM to classify, label, triage or rate text with confidence scores — including choosing between the logprobs, grammar, structured and discrete methods, making it work on reasoning models, Gemini's OpenAI-compatibility endpoint or Claude (which reject logprobs), pointing an anthropic client at a local server with api="messages" or a thinking budget, fixing LabelReadoutError, MalformedAnswerError or ProviderError, cutting cost with prompt caching and prompt_cache_key, wiring in llama.cpp/vLLM/Ollama/SGLang, adding few-shot examples or reasoning, and testing an integration without spending provider tokens.
+description: Writes and debugs Python code that calls jevper — the Jev (System One) interface that turns a state plus Noul/Choice/Score questions into typed answers with probabilities and confidence, over any OpenAI-compatible model. Use whenever the user mentions jevper, the Jev or System One API, TypeSafe-style classification, or wants an LLM to classify, label, triage or rate text with confidence scores — including choosing between the logprobs, grammar, structured and discrete methods, making it work on reasoning models, Gemini's OpenAI-compatibility endpoint or Claude (which reject logprobs), pointing an anthropic client at a local server with api="messages" or a thinking budget, fixing LabelReadoutError, MalformedAnswerError, IncompleteAnswerError or ProviderError, cutting cost with prompt caching and prompt_cache_key, wiring in llama.cpp/vLLM/Ollama/SGLang, adding few-shot examples or reasoning, and testing an integration without spending provider tokens.
 ---
 
 # jevper
@@ -13,7 +13,7 @@ hosted models and self-hosted llama.cpp/vLLM/Ollama/SGLang servers work the same
 rendered last so a rubric's prompts share a cacheable prefix. `openai` and `anthropic` are not runtime
 dependencies; `pydantic>=2.7` is. Python 3.10+.
 
-Written against jevper 0.5.3; if you are on a newer release, check its `docs/` — the library is the
+Written against jevper 0.6.0; if you are on a newer release, check its `docs/` — the library is the
 authority.
 
 ## Quick start
@@ -53,15 +53,16 @@ message list, `{"messages": [...]}`, or any JSON value (rendered as pretty-print
 | Question | Criteria | Answer fields |
 | --- | --- | --- |
 | `Noul(instructions=..., criteria={"true": ..., "false": ...})` | optional | `noul` (probability of `true`) — no `confidence` |
-| `Choice(instructions=..., criteria={"key": "what belongs in it"})` | 2–255 keys | `choice`, `probabilities`, `confidence` |
+| `Choice(instructions=..., criteria={"key": "what belongs in it"})` | 1–255 keys | `choice`, `probabilities`, `confidence` |
 | `Score(instructions=..., criteria=["level 0", "level 1", ...])` | 2–10 levels | `score`, `legend`, `probabilities`, `confidence` |
 
 - Criteria descriptions are prompts, not labels: write what belongs in each option. They are rendered
   verbatim, and the model picks between them.
 - Unknown fields are rejected (`extra="forbid"`); raw mappings (`{"type": "choice", "criteria": {...}}`)
   are parsed and validated exactly like the classes.
-- `Score.score` is the probability-weighted level index `Σ i·pᵢ` over zero-based levels; `legend` maps
-  level index to your description.
+- `Score.score` is the probability-weighted level index `Σ i·pᵢ` over zero-based levels, read off the
+  distribution rescaled to 1 — so it stays on the 0..N-1 line even with `normalize_probabilities=False`,
+  where the reported probabilities are the model's own — and `legend` maps level index to your description.
 - `confidence` for `choice` is `(max(p) − 1/n) / (1 − 1/n)` — the peak rescaled from uniform (0) to
   certainty (1). For `score` it is `max(0, 1 − MAD/MAD_uniform)`. `noul` has none, and `discrete` (one-hot)
   always yields `1.0`.
@@ -107,10 +108,12 @@ rejected are not counted in `usage.n_calls`.
 
 `api="messages"` (an `anthropic.Anthropic` client) is the third surface and the only one with no label
 readout: no logprobs exist in that API, so `auto` answers with `structured` there without spending a call,
-and a pinned `logprobs`/`grammar` raises `UnsupportedMethodError` before any request. It has no schema field
-either, so the JSON Schema travels in the system prompt (set `temperature=0.0` there); `max_tokens` is
-required and jevper sends `1024` — plus your thinking budget, since this API wants the budget strictly
-*below* `max_tokens` — unless `extra_body={"max_tokens": n}` overrides both. Thinking is a budget here,
+and a pinned `logprobs`/`grammar` raises `UnsupportedMethodError` before any request. Its schema travels as
+Anthropic's own `output_config.format` field, with the JSON Schema also kept in the system prompt — a server
+can accept that field and drop it without a word, and the prompt is the only place the shape is then stated
+(set `temperature=0.0` there); a server that refuses the field has it dropped and the call re-asked.
+`max_tokens` is required and jevper sends `1024` — plus your thinking budget, since this API wants the budget
+strictly *below* `max_tokens` — unless `extra_body={"max_tokens": n}` overrides both. Thinking is a budget here,
 `ReasoningConfig(budget_tokens=n)`, which `mode="auto"` selects on its own on this surface; a server that
 does not know the field at all (SGLang's) has it dropped and the call re-asked, while one that refuses the
 number gets its own error back.
@@ -138,7 +141,8 @@ With `auto` you do not have to know any of it; pin `method` only for a stated re
 
 `logprobs` and `grammar` read a single label token, so they cap a `Choice` at 26 options and raise
 `InvalidQuestionError` past that (they name the two methods that take more). `auto`, `structured` and
-`discrete` handle the full 2–255 range with two-letter labels.
+`discrete` handle the full 1–255 range with two-letter labels, and a one-option `Choice` — a question with
+no rival to read — is answered by every method, `logprobs` included, at probability 1.0.
 
 Check what actually happened before debugging blind:
 
@@ -181,20 +185,23 @@ Per-server reporting, the measured reuse, and isolating a cache with `extra_body
 
 ## Failures
 
-Three groups, and only the middle one is worth catching for control flow:
+Four groups, and only the two middle ones are worth catching for control flow:
 
 | Error | Raised when | What to do |
 | --- | --- | --- |
 | `InvalidQuestionError`, `UnsupportedMethodError`, `ClientCapabilityError` | before any request: bad question or example (every example is checked up front, before the first call), `grammar` on the wrong surface or `logprobs`/`grammar` on the Messages surface, client missing the attribute a surface needs, or a response with no usable first choice and no explanation | fix the code — these cost nothing and never need a retry |
 | `LabelReadoutError`, `MalformedAnswerError` | the answer could not be read; retried once by default (`n_retry_malformed`) with a correction turn | usually leave it alone; `auto` turns the provider-side cases into `structured` instead |
+| `IncompleteAnswerError`, `ModelRefusalError` | the provider stopped generating before the answer was complete (a spent output budget, or a context window too small) or reported that the model declined — both are `ProviderError` subclasses raised *before* any readout, because a cut-off or declined generation is not an answer to correct | fix the request, not the reader: turn thinking off, raise `extra_body={"max_tokens": ...}` or shorten the state; a refusal needs a different request or model, and a retry is refused the same way |
 | `ProviderError` | a provider call failed after transient retries; `.attempts` and `.status_code` hold the history, including a status carried inside a `200` body (OpenRouter), and it is also what you get when no surface the client can speak has the route — a missing route is the provider's failure, not a verdict jevper keeps | the only one worth a retry loop of your own, and the one to catch at a service boundary |
 
 `JevperError` is the base class — catch it if you want one handler for everything, including constructor
-misuse (a count option that is not an integer, a blank `model`, an unknown `method`/`api`), a bad `state`
-message, and content that is not JSON-serializable or carries a non-finite number.
+misuse (a count option that is not an integer or out of range, a blank `model`, an unknown `method`/`api`), a
+bad `state` message, and content that is not JSON-serializable or carries a non-finite number.
 Transient failures (`408`, `429`, `500`, `502`, `503`, `504`, `529`, connection and timeout errors, httpx
 transport errors) are retried per call with `RetryPolicy(n_retries=2, base_delay=0.5, max_delay=8.0)`, at
-`min(base_delay · 3ⁿ, max_delay)`; a `Retry-After` header is not read.
+`min(base_delay · 3ⁿ, max_delay)`. A rate-limited provider's own `Retry-After` or `retry-after-ms` header —
+delta-seconds or an HTTP date, in any case — replaces that backoff, uncapped by `max_delay` because the wait
+is the server's to set; `respect_retry_after=False` keeps the curve alone.
 
 MLflow traces the same story without jevper's help: `mlflow.openai.autolog()` and `mlflow.anthropic.autolog()`
 patch SDK resource classes, so every call through a real OpenAI/Anthropic SDK client — rejected, retried and
@@ -204,11 +211,11 @@ parent; a duck-typed client is not autologged.
 
 A server that refuses a field jevper added for capability does not fail the call: `response_format` (or
 `text.format`) walks `json_schema` → `json_object` → nothing, then the reasoning parameters, then the
-Responses `include` list, then `prompt_cache_key`, then the Messages `thinking` field. Each rung is
-remembered for that surface, and the question is still answered — with a fresh retry budget, since the
-attempts the old request shape spent say nothing about the new one. `debug["server_limits"]` reports the
-rungs of the surface the *answer* came from, so a refusal on a surface jevper later left is narrated in
-`debug["retry_reasons"]` instead — read both when a ladder step seems to be missing.
+Responses `include` list, then `prompt_cache_key`, then the Messages `output_config` and `thinking` fields.
+Each rung is remembered for that surface, and the question is still answered — with a fresh retry budget,
+since the attempts the old request shape spent say nothing about the new one. `debug["server_limits"]`
+reports the rungs of the surface the *answer* came from, so a refusal on a surface jevper later left is
+narrated in `debug["retry_reasons"]` instead — read both when a ladder step seems to be missing.
 Only a complaint about the field's *existence* moves the ladder: a refusal of the value
 (`budget_tokens: must be at least 1024`) travels back as the provider's own error. A capability field you
 named in `extra_body` is dropped with jevper's own — the SDK merges `extra_body` last, so leaving it there
@@ -227,25 +234,27 @@ Three traps worth knowing:
   With `normalize_probabilities=False` they are handed back exactly as the provider sent them, a value
   above 1 included (a negative or non-finite one is still a malformed answer) — normalize them yourself
   if your code assumes a distribution.
-- **An answer that never arrived says why.** A reasoning model can spend the whole output budget thinking,
-  and the error text then names the stop reason (`finish_reason: 'length'` /
-  `incomplete_details.reason: 'max_output_tokens'` / `stop_reason: 'max_tokens'`) and suggests
-  `extra_body={"max_tokens": ...}` — nobody sends those caps, so raise it and turn thinking off too. A
-  model that *refused* reads as a refusal rather than as malformed JSON: Chat Completions puts it in a
-  `refusal` sibling of a null `content`, Responses in a `refusal` content part, the Messages API in
-  `stop_reason: 'refusal'`, and the message carries the model's own words where the surface has them. When
-  the reasoning parser swallowed the whole generation into a thinking block and returned no answer text, the
-  same error says the response carried reasoning only: a server-side deployment setting, not something
-  another retry fixes.
+- **An answer that never arrived is not a malformed one.** A generation the provider cut short — a reasoning
+  model spending the whole output budget thinking — is `IncompleteAnswerError`, naming the stop reason
+  (`finish_reason: 'length'` / `incomplete_details.reason: 'max_output_tokens'` /
+  `stop_reason: 'max_tokens'`) and suggesting `extra_body={"max_tokens": ...}`; nobody sends those caps, so
+  raise it and turn thinking off. A context window too small is terminal in the same way but wants the
+  opposite remedy, so that message says to shorten the state or the examples. A model that *refused* is
+  `ModelRefusalError` — a `refusal` beside a null `content`, a `refusal` content part, or
+  `stop_reason: 'refusal'`, with the model's own words where the surface has them. None of the three spends
+  the corrective retry a malformed answer gets. A reasoning parser that swallowed the whole generation into a
+  thinking block *is* a `MalformedAnswerError` ("the response carried reasoning only"): a serving-side
+  setting, not something another retry fixes.
 
 ## Test without spending tokens
 
 `scripts/offline_stub.py` is a duck-typed client that answers from canned bodies — no HTTP, no key — while
-the real readout path (logprobs softmax, structured JSON, `auto`'s fallback and surface move, the same move
-under a pinned `method="logprobs"`, the server-limits ladder and the refusals it does not absorb, the schema
-that travels in the prompt when the request cannot carry one, the message a truncated or refused answer
-carries) runs end to end. Its `surface=` knob picks which endpoints the fake client exposes:
-`chat_completions`, `responses`, `messages` (the Anthropic shape) or `both`.
+the real readout path runs end to end: the logprobs softmax, structured JSON, `auto`'s fallback and surface
+move (and the same move under a pinned `method="logprobs"`), the server-limits ladder and the refusals it
+does not absorb, the schema that travels in `output_config` and in the prompt, the quoted untrusted state,
+and the errors a cut-off, over-long or refused answer raises instead of reading. Its `surface=` knob picks
+which endpoints the fake client exposes: `chat_completions`, `responses`, `messages` (the Anthropic shape)
+or `both`. It needs jevper 0.6.0 or newer.
 
 ```python
 import sys
@@ -263,7 +272,8 @@ assert stub.requests[0]["logprobs"] is True                  # and it did ask fo
 
 Scenarios: `logprobs`, `structured`, `reject_logprobs`, `reject_include`, `no_alternatives`,
 `no_responses_route`, `no_messages_route`, `reject_schema`, `reject_format`, `reject_cache_key`,
-`reject_thinking`, `reject_budget_value`, `truncated`, `refusal`, `reasoning`, `reasoning_only`. Run
+`reject_thinking`, `reject_budget_value`, `reject_output_config`, `truncated`, `truncated_context`,
+`failed_response`, `refusal`, `reasoning`, `reasoning_only`. Run
 `python scripts/offline_stub.py --check` from the skill directory for a self-test, and
 `python scripts/offline_stub.py --live --model <id>` (add `--api messages` for an Anthropic-compatible
 server, `--extra-body '{"chat_template_kwargs": {"enable_thinking": false}}'` for a local server whose

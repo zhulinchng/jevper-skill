@@ -10,23 +10,23 @@ npx skills add zhulinchng/jevper-skill
 
 Single-skill repo: root `SKILL.md` with valid `name` + `description` frontmatter, so the installer picks it up directly (`--list` shows it without installing; `-a '*'` installs to every detected agent).
 
-Written and verified against **jevper 0.5.3** (Python 3.10+, `pydantic>=2.7`). Every behaviour it describes — methods, fallbacks, the server-limits ladder, prompt caching, the three surfaces, error messages — was checked against that release; if you are on a newer one, its `docs/` is the authority.
+Written and verified against **jevper 0.6.0** (Python 3.10+, `pydantic>=2.7`). Every behaviour it describes — methods, fallbacks, the server-limits ladder, prompt caching, the three surfaces, error messages — was checked against that release, on five local servers; if you are on a newer one, its `docs/` is the authority.
 
 ## What it covers
 
-- **Questions**: `Noul` (one probability of true), `Choice` (2–255 labelled options), `Score` (2–10 ordered levels) — criteria rendered as prompts, answers carrying `choice`/`probabilities`/`confidence`, `score`/`legend`, `noul`, and how each `confidence` is computed
+- **Questions**: `Noul` (one probability of true), `Choice` (1–255 labelled options, a one-option question answered by every method), `Score` (2–10 ordered levels, read as an expected value) — criteria rendered as prompts, answers carrying `choice`/`probabilities`/`confidence`, `score`/`legend`, `noul`, and how each `confidence` is computed
 - **Methods**: leave `method` unset and `auto` answers with `logprobs` where the provider returns them, `structured` where it does not, remembered per `(model, surface)`; when to pin `grammar`, `discrete`, `structured` or `logprobs` instead — and the 26-option ceiling on the two methods that read a label *token*
-- **Surfaces**: Chat Completions and Responses from an OpenAI-compatible client, plus the Anthropic **Messages** API (`api="messages"`, an `anthropic.Anthropic` client) — where no logprobs exist at all, the JSON Schema travels in the system prompt, `max_tokens` is required (jevper sends `1024`, or `1024` plus the thinking budget) and thinking is a `budget_tokens` field
-- **Fallbacks**: the surface move when a route is missing (404) or answers without a distribution — which a pinned `method="logprobs"` also takes, and which a `grammar` request never does — the capability-versus-bad-value distinction that decides what gets remembered *and* what may be dropped, the finite ladder that drops a refused schema (`json_schema` → `json_object` → nothing), reasoning parameters, the Responses `include` list, `prompt_cache_key` and the Messages `thinking` field
+- **Surfaces**: Chat Completions and Responses from an OpenAI-compatible client, plus the Anthropic **Messages** API (`api="messages"`, an `anthropic.Anthropic` client) — where no logprobs exist at all, the JSON Schema rides in Anthropic's `output_config` field *and* in the system prompt, `max_tokens` is required (jevper sends `1024`, or `1024` plus the thinking budget) and thinking is a `budget_tokens` field
+- **Fallbacks**: the surface move when a route is missing (404) or answers without a distribution — which a pinned `method="logprobs"` also takes, and which a `grammar` request never does — the capability-versus-bad-value distinction that decides what gets remembered *and* what may be dropped, the finite ladder that drops a refused schema (`json_schema` → `json_object` → nothing), reasoning parameters, the Responses `include` list, `prompt_cache_key` and the Messages `output_config` and `thinking` fields
 - **Provider support**: who returns logprobs (OpenAI chat models, DeepSeek, Together, llama.cpp, vLLM, SGLang, Ollama, LM Studio) and who rejects the fields (OpenAI reasoning models, Claude, Gemini's OpenAI-compatibility endpoint, OpenRouter's routing), with the exact error strings, per-surface request fields, what to pass to each local server, how to turn thinking off, and a one-line probe
 - **Prompt caching**: the state-last message order (and the one state shape that cannot use it), the per-question derived `prompt_cache_key` — model, method, examples and question block — and how to override it, `usage.cached_tokens` and which server flag makes it appear, cache isolation via `cache_salt`, and the measured reuse numbers
-- **Answers that never arrived**: the output budget each surface names (`length`, `max_output_tokens`, `max_tokens`), a model's refusal and its own words, and a reasoning parser that returned no answer text — all said in the error rather than left as "malformed JSON"
+- **Answers that never arrived**: `IncompleteAnswerError` and `ModelRefusalError` — a spent output budget, a context window too small, a model's refusal with its own words — raised as `ProviderError` subclasses before any readout, so a cut-off or declined generation is never read as a decision and no corrective retry is spent on one
 - **Reasoning**: `ReasoningConfig` — native provider reasoning vs a two-step analysis-then-answer pass, `reasoning_text()`, and the doubled call count that comes with it
 - **Tracing**: MLflow SDK autolog traces calls through real OpenAI/Anthropic SDK clients, including rejected and fallback attempts; `@mlflow.trace` groups the per-SDK-call spans, and `pyfunc` or LangChain adapters can host jevper as a model
 - **Few-shot examples**: `Example`, the three attachment levels and their precedence, answers rendered in the active method's format, calibration through explicit `probabilities`
 - **Async**: `AsyncSystemOneClient`, same signatures, semaphore instead of thread pool
-- **Client knobs**: `temperature`, `top_logprobs`, `structured_outputs`, `prompt_cache_key`, `normalize_probabilities`, `max_concurrency`, `n_retry_malformed`, `retry`, `api`
-- **Failure triage**: which errors are local (zero requests sent), which are readout failures worth one corrective retry, which are `ProviderError`; transient retry policy; answers that ended early — or carried reasoning only — and say why; the `debug` keys that show what actually happened
+- **Client knobs**: `temperature`, `top_logprobs`, `structured_outputs`, `prompt_cache_key`, `normalize_probabilities`, `max_concurrency`, `n_retry_malformed`, `retry` (`Retry-After` honoured by default), `api`
+- **Failure triage**: which errors are local (zero requests sent), which are readout failures worth one corrective retry, which are `ProviderError`; the transient retry policy and the `Retry-After` header it waits out; answers that ended early, were refused, or carried reasoning only — and say why; the `debug` keys that show what actually happened
 - **Offline testing**: a duck-typed stub client that drives the real readout path from canned bodies — no HTTP, no key, no tokens — plus a live probe that reads what a model advertises before it spends a call
 
 ## Layout
@@ -35,12 +35,12 @@ Written and verified against **jevper 0.5.3** (Python 3.10+, `pydantic>=2.7`). E
 - `references/features.md` — reasoning, few-shot examples, async, surfaces, prompt caching, MLflow tracing, client knobs
 - `references/providers.md` — the observed logprob matrix, per-surface request fields, local servers, the Anthropic Messages route, cache reporting
 - `references/troubleshooting.md` — error triage, `debug` recipes, symptom → fix
-- `scripts/offline_stub.py` — duck-typed stub client, OpenAI- or Anthropic-shaped (scenarios: `logprobs`, `structured`, `reject_logprobs`, `reject_include`, `no_alternatives`, `no_responses_route`, `no_messages_route`, `reject_schema`, `reject_format`, `reject_cache_key`, `reject_thinking`, `reject_budget_value`, `truncated`, `refusal`, `reasoning`, `reasoning_only`) plus its own self-test and live probe
+- `scripts/offline_stub.py` — duck-typed stub client, OpenAI- or Anthropic-shaped (scenarios: `logprobs`, `structured`, `reject_logprobs`, `reject_include`, `no_alternatives`, `no_responses_route`, `no_messages_route`, `reject_schema`, `reject_format`, `reject_cache_key`, `reject_thinking`, `reject_budget_value`, `reject_output_config`, `truncated`, `truncated_context`, `failed_response`, `refusal`, `reasoning`, `reasoning_only`) plus its own self-test and live probe
 
 ## Verify
 
 ```bash
-pip install jevper                                 # Python 3.10+, pydantic>=2.7; 0.5.3 or newer
+pip install jevper                                 # Python 3.10+, pydantic>=2.7; 0.6.0 or newer
 python scripts/offline_stub.py --check             # offline self-test: no network, no API key
 python scripts/offline_stub.py --live --model <id> # needs openai + OPENAI_API_KEY; OPENAI_BASE_URL for self-hosted
                                          # reads the model's advertised parameters first (free, no quota), then spends one call

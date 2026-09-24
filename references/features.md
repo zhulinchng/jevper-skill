@@ -105,7 +105,7 @@ surface is `messages`. A client missing the attribute the chosen surface needs r
 | --- | --- | --- | --- |
 | input | `messages=[...]` | `input=[...]`, `store=false` | `messages=[...]` + top-level `system` |
 | logprobs | `logprobs=true`, `top_logprobs=N` | `top_logprobs=N`, `include=["message.output_text.logprobs"]` | none — the API has no such field |
-| JSON schema | `response_format={"type": "json_schema", ...}` | `text={"format": {"type": "json_schema", ...}}` | none — the schema goes in the system prompt |
+| JSON schema | `response_format={"type": "json_schema", ...}` | `text={"format": {"type": "json_schema", ...}}` | `output_config={"format": {"type": "json_schema", ...}}`, sent in the body; the schema also stays in the system prompt |
 | grammar | `extra_body={"grammar": "..."}` | not available | not available |
 | output cap | server default | server default | `max_tokens` required: jevper sends `1024`, or `1024` + the thinking budget |
 
@@ -115,13 +115,21 @@ always sends `max_tokens` there (`1024`, or `1024` plus `ReasoningConfig(budget_
 requires the budget to be strictly below it; `extra_body={"max_tokens": n}` overrides both). Any other
 provider field goes through `extra_body` — a key you name there is what reaches the wire, because the SDK
 merges `extra_body` after the typed parameters, and a capability field among them is dropped along with
-jevper's own when a server has refused it. (On the Messages surface in 0.5.3 that body is attached only when a
-`temperature` is set and jevper's own thinking is off — see [Client knobs](#client-knobs).)
+jevper's own when a server has refused it. That is also how `output_config` is sent: it travels in the body
+rather than as a typed keyword, so the oldest `anthropic` SDK jevper supports (`>=0.49`, which has no such
+parameter and would raise `TypeError` before sending anything) can carry it.
 
-Wherever the request cannot state the answer's shape, the JSON Schema travels in the prompt instead: always
-on the Messages surface, and on the OpenAI surfaces when `structured_outputs=False` or the server refused the
-strict schema. It joins the leading system message, so the question block keeps its place — and the answer's
-shape is then only as good as the model's instruction-following.
+The schema travels in the prompt wherever the request cannot be relied on to state it: always on the Messages
+surface, and on the OpenAI surfaces when `structured_outputs=False` or the server refused the strict schema.
+On the Messages surface the prompt keeps it even when the field was sent, because a server can accept
+`output_config` and drop it without a word — the same silence as a server that never read it. It joins the
+leading system message, so the question block keeps its place — and where the request no longer states the
+shape, the answer's shape is only as good as the model's instruction-following.
+
+Anthropic's structured outputs implement a documented subset of JSON Schema, and an unsupported keyword is a
+`400` rather than a warning. jevper's own schemas bound every probability at `minimum: 0`, so the wire
+schema has each such bound moved into the description of the field it bounded (`Must be at least 0.`) while
+the prompt keeps the full schema, where text can say what a constraint says.
 
 `auto` also falls back between the surfaces, and both verdicts are remembered for the client's life:
 
@@ -148,6 +156,14 @@ The state goes last (`system`, examples, question block, state) so a rubric's ca
 prefix; a chat-list `state` carrying its own `system`/`developer` turn has that content folded into jevper's
 system prompt, because a system turn after a user turn is a `400` on vLLM and SGLang and a 500 on
 llama.cpp's Qwen template. Keep a `state` list to `system`/`user`/`assistant` turns.
+
+The state is the content under judgement, so it is treated as data rather than as instructions: a one-value
+state is wrapped in `<document>` markers with its angle brackets escaped to their JSON form, a hoisted
+`system`/`developer` turn is quoted the same way, and every system prompt says the state is untrusted and
+must not be obeyed. A state cannot close its own wrapper and carry on as prompt text. A list of dicts is a
+conversation and keeps its roles; a list of anything else (`[1, 2]`, `["a", "b"]`) is content and is quoted
+like any other value, while an empty list is refused. This is prompt hardening, not a sandbox — a model can
+still be persuaded.
 
 ## Prompt caching
 
@@ -223,8 +239,12 @@ instance cannot carry one — and log the code with `python_model="<path>"`; the
 picklable `SimpleChatModel` that takes its `base_url` and `model` from the `model_config` logged beside it.
 `log_model` runs your `input_example` through the model while logging, so an integration that cannot answer
 its own example fails there, not later. The standalone `mlflow gateway start` is deprecated in favour of
-the server-hosted gateway. Full detail, verified against MLflow 3.16.1, is the library's `docs/mlflow.md`;
-the extra is `pip install 'mlflow[gateway,langchain]>=3.16'`.
+the server-hosted gateway. Behind that gateway — as opposed to calling a provider directly — two things
+change: it serves no `/v1/responses` route, so `api="auto"` pays one 404 and answers on Chat Completions, and
+it drops `choices[].logprobs` and `message.reasoning_content` from what it forwards, so a label readout cannot
+work through it (`auto` falls back to `structured`) and `reasoning_text()` is empty there. Full detail,
+verified against MLflow 3.16.1, is the library's `docs/mlflow.md`; the extra is
+`pip install 'mlflow[gateway,langchain]>=3.16'`.
 
 ## Client knobs
 
@@ -232,19 +252,19 @@ the extra is `pip install 'mlflow[gateway,langchain]>=3.16'`.
 | --- | --- | --- |
 | `method` | `"auto"` | you have a reason (see SKILL.md) |
 | `api` | `"auto"` (prefers Responses, then Chat Completions, then Messages) | a client exposes several surfaces and you want a specific one |
-| `top_logprobs` | `20` | an integer, at most 20; lower it only if the provider rejects the field. A pinned `logprobs`/`grammar` needs at least 2, since one logprob is not a distribution. A provider whose cap is lower refuses the *value* (`Invalid 'top_logprobs': integer must be between 0 and 5`), which falls back for that question without writing logprobs off for good. The `[0, 20]` range the library documents is enforced from above only: under `auto` a negative value is not refused and reaches the provider, so keep it at 0 or more yourself |
+| `top_logprobs` | `20` | an integer in `[0, 20]`, enforced locally for every method; lower it only if the provider rejects the field. A pinned `logprobs`/`grammar` needs at least 2, since one logprob is not a distribution. A provider whose cap is lower refuses the *value* (`Invalid 'top_logprobs': integer must be between 0 and 5`), which falls back for that question without writing logprobs off for good |
 | `structured_outputs` | `True` | `False` sends `{"type": "json_object"}` instead of a strict schema, and the schema then travels in the system prompt — for providers that reject strict schemas; a server that refuses the format field outright then skips that rung and is re-asked without one |
 | `prompt_cache_key` | `None` (derived per question) | route one rubric's calls to a shared cache, or keep tenants apart; non-blank, at most 256 characters |
-| `normalize_probabilities` | `True` | `False` returns the model's `structured` numbers verbatim — the provider's own values, a mass above 1 included, with the error still recorded in `debug`; a negative or non-finite value is a `MalformedAnswerError` either way |
+| `normalize_probabilities` | `True` | `False` returns the model's `structured` numbers verbatim — the provider's own values, a mass above 1 included, with the error still recorded in `debug`; a negative or non-finite value is a `MalformedAnswerError` either way. A `Score` is still read off the rescaled distribution, so `score` stays on the 0..N-1 line while the reported probabilities do not |
 | `max_concurrency` | `8` | your provider rate-limits per key |
 | `n_retry_malformed` | `1` | a model that keeps answering in prose |
-| `retry` | `RetryPolicy()` | transient-failure retries: `n_retries=2`, `base_delay=0.5`, `max_delay=8.0` |
-| `extra_body`, `extra_headers` | `None` | provider-specific fields — including `max_tokens` on the Messages surface, where jevper's `1024` default may be too small. A key named here is what reaches the wire (the SDK merges `extra_body` last), so it also wins over jevper's own value for that field. On the Messages surface in 0.5.3 that body is attached only when a `temperature` is set *and* jevper's own thinking is off, so a key you rely on there (the local servers' `chat_template_kwargs`) needs `temperature=0.0` beside it; `max_tokens` is read out of it either way |
+| `retry` | `RetryPolicy()` | transient-failure retries: `n_retries=2`, `base_delay=0.5`, `max_delay=8.0`, `respect_retry_after=True` — a `Retry-After`/`retry-after-ms` header (delta-seconds or an HTTP date) replaces the backoff, uncapped by `max_delay`; set it `False` for the curve alone |
+| `extra_body`, `extra_headers` | `None` | provider-specific fields — including `max_tokens` on the Messages surface, where jevper's `1024` default may be too small, and the local servers' `chat_template_kwargs` that turns thinking off. A key named here is what reaches the wire (the SDK merges `extra_body` last), so it also wins over jevper's own value for that field; jevper's own copy of a capability field is dropped with it when a server refuses that field |
 
-Constructor misuse (unknown `method`/`api`, a count option that is not an integer, `top_logprobs` above 20,
-a pinned label method below 2, `max_concurrency < 1`, a negative retry field, a blank or over-long
-`prompt_cache_key`, a `model` that is not a non-blank string) raises `JevperError` immediately, so a typo
-never reaches a provider — and so does a per-call `api=""`/`method=""` or `model=""`,
+Constructor misuse (unknown `method`/`api`, a count option that is not an integer, `top_logprobs` outside
+`[0, 20]` or below 2 with a pinned label method, `max_concurrency < 1`, a negative retry field, a blank or
+over-long `prompt_cache_key`, a `model` that is not a non-blank string) raises `JevperError` immediately, so
+a typo never reaches a provider — and so does a per-call `api=""`/`method=""` or `model=""`,
 since an override is only used when it is not `None`. `ReasoningConfig` is a pydantic model, so its
 own validation (`effort`, `budget_tokens`, `mode`) raises `pydantic.ValidationError` at the point you build
 it, not from the client; `budget_tokens` stays validated if you assign to it afterwards.

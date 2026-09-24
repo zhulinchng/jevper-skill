@@ -8,7 +8,7 @@
 
 ## Does this provider do logprobs?
 
-Observed against each provider's live API, as of jevper 0.5.3 — providers move, so treat a row as a
+Observed against each provider's live API, as of jevper 0.6.0 — providers move, so treat a row as a
 starting point rather than a law, and let `auto` verify it per `(model, surface)` for you.
 
 | Provider | `logprobs` | Note |
@@ -59,8 +59,9 @@ and the next step — because it is not a jevper failure. On OpenRouter that mea
 one **account-wide** cap, 50 requests/day with no credits and 1000 once $10 or more is purchased, reset
 midnight UTC, so a different `:free` model id does not get around an exhausted cap; a few `:free` ids answer
 `403` because they are reserved for agentic harnesses; and `402` means the account is out of credits.
-`429` and `503` may carry `Retry-After`, which the OpenAI and Anthropic SDKs honour on their own — jevper
-does not read it.
+`429` and `503` may carry `Retry-After` or `retry-after-ms` (delta-seconds or an HTTP date), which jevper
+honours by default — it waits as long as the server asked, which `max_delay` does not cap;
+`RetryPolicy(respect_retry_after=False)` keeps the backoff curve alone.
 
 ## Surfaces
 
@@ -73,7 +74,7 @@ needs raises `ClientCapabilityError` naming the surface to pass explicitly.
 | --- | --- | --- | --- |
 | messages | `messages=[...]` | `input=[...]`, plus `store=false` | `messages=[...]` + top-level `system` |
 | logprobs | `logprobs=true`, `top_logprobs=N` | `top_logprobs=N`, `include=["message.output_text.logprobs"]` | none — the API has no such field |
-| JSON schema | `response_format={"type": "json_schema", "json_schema": {...}}` | `text={"format": {"type": "json_schema", ...}}` | none — the schema goes in the system prompt |
+| JSON schema | `response_format={"type": "json_schema", "json_schema": {...}}` | `text={"format": {"type": "json_schema", ...}}` | `output_config={"format": {"type": "json_schema", ...}}` in the body, and the schema in the system prompt too |
 | schema fallback (`structured_outputs=False`) | `response_format={"type": "json_object"}` | `text={"format": {"type": "json_object"}}` | the prompt, always |
 | grammar | `extra_body={"grammar": "..."}` | not available | not available |
 | reasoning | `reasoning_effort` (only when `effort` is set) | `reasoning={effort, summary, context}` | `thinking={"type": "enabled", "budget_tokens": n}` (only when `budget_tokens` is set) |
@@ -88,11 +89,13 @@ protocol is the exception — it has no server-side default, so jevper always se
 OpenRouter's Responses API is stateless — `store: true` or a `previous_response_id` is a `400` — so the
 `store=false` jevper already sends is the form it accepts, and the whole history travels in `input` each call.
 
-Where a request cannot state the answer's shape — the Messages API has no schema field, and a server that
-refuses the strict schema is re-asked with a plain JSON object — jevper appends the JSON Schema to the
-system prompt, so the model still knows which keys to answer with. The answer's shape is then only as good
-as its instruction-following: on such a surface expect more `MalformedAnswerError`s, set
-`temperature=0.0`, and keep the criteria descriptions unambiguous.
+Where a request cannot be *relied on* to state the answer's shape, the JSON Schema also travels in the
+system prompt: always on the Messages surface, and on the OpenAI surfaces when `structured_outputs=False` or
+the server refused the strict schema. A server can accept a schema field and drop it without a word, so on
+the Messages route jevper sends Anthropic's own `output_config.format` *and* keeps the schema in the prompt —
+the prompt is the only place the shape is stated on a server that silently ignores the field. Where the
+request no longer states it, the answer's shape is only as good as the model's instruction-following: expect
+more `MalformedAnswerError`s, set `temperature=0.0`, and keep the criteria descriptions unambiguous.
 
 A client object cannot say whether the *server* implements a route — `openai.OpenAI` exposes
 `responses.create` either way — so `auto` reads the responses:
@@ -113,10 +116,11 @@ A client object cannot say whether the *server* implements a route — `openai.O
 - An explicit `api="responses"` is a decision, not a preference: its 404 reaches you unchanged.
 
 When a server refuses a request field jevper added — `response_format`, `text.format`, `reasoning_effort`,
-`reasoning`, the `include` list, `prompt_cache_key`, or the Messages `thinking` field — the field is dropped
-and the same call re-asked, one step down the ladder at a time (`json_schema` → `json_object` → nothing),
-remembered per surface and reported in `debug["server_limits"]` for the surface that answered. None of them
-is needed to answer the question.
+`reasoning`, the `include` list, `prompt_cache_key`, or the Messages `output_config` and `thinking` fields —
+the field is dropped and the same call re-asked, one step down the ladder at a time
+(`json_schema` → `json_object` → nothing; on the Messages surface the only rung is `output_config`, where the
+prompt is where the schema lived before the field existed), remembered per surface and reported in
+`debug["server_limits"]` for the surface that answered. None of them is needed to answer the question.
 
 ## Local servers
 
@@ -136,8 +140,9 @@ A local server is the same client with a different `base_url`. Checked on one 12
 without a distribution it re-asks on Chat Completions and remembers the verdict. `api="chat_completions"`
 skips the discovery entirely. All five also answer the Anthropic Messages route, so `auto` has three
 surfaces to choose from on any of them; ollama, llama.cpp, SGLang and LM Studio were exercised through it
-directly, and vLLM answers `200` with a thinking block and **no text** for a Qwen3-4B model — jevper reports
-an empty answer naming the stop reason, and the cause is the server's template, so use its OpenAI surfaces.
+directly, and vLLM answers `200` with a thinking block and **no text** for a Qwen3-4B model — jevper raises
+`IncompleteAnswerError` naming the stop reason, and the cause is the server's template, so use its OpenAI
+surfaces.
 
 **Thinking is the one decision you must make.** `logprobs` and `grammar` read a one-token
 answer, and every one of these servers reports logprobs for *every* generated token — with thinking on,
@@ -212,8 +217,15 @@ Four protocol facts shape what the client does on this surface:
 - **No logprobs exist in it** — not withheld by some servers, absent from the API. `method="logprobs"` and
   `"grammar"` raise `UnsupportedMethodError` before any request is sent, and `method="auto"` answers with
   `structured` without spending a call to find out.
-- **No schema field either**, so `structured`/`discrete` carry the JSON Schema in the system prompt, and the
-  answer's shape is only as good as the model's instruction-following.
+- **A schema field now exists** — Anthropic's own `output_config.format`, sent in the request body (the
+  oldest SDK jevper supports has no parameter for it) with each unsupported bound moved into the field's
+  description, and the JSON Schema still in the system prompt. Whether it does anything is the server's
+  business, and four of the five local ones say nothing either way: measured on 0.6.0, only vLLM *enforces*
+  it (a schema whose only legal answer names a constant the prompt never mentions comes back with that
+  constant, and an unknown `format.type` is a `400` naming `body.output_config.format.type`), while
+  llama.cpp and LM Studio accept the field and ignore it. ollama and SGLang accept it too, but with a
+  thinking model nothing comes back on that route to enforce it — a 1024-token request returns empty with
+  `stop_reason: "max_tokens"` with the field, with a nonsense one, and with no field at all.
 - **`max_tokens` is required** by vLLM's and SGLang's implementations and has no default on any of them, so
   jevper always sends one: `1024`, or `1024` plus the caller's `ReasoningConfig(budget_tokens=n)`, because
   this API also requires the thinking budget to be strictly *below* `max_tokens` and would refuse the 1024
@@ -230,17 +242,20 @@ Four protocol facts shape what the client does on this surface:
 - **A `system` role inside `messages` is not part of the API** — Anthropic has since added mid-conversation
   `system` messages, but none of these servers implements them, rendering a `system` turn positionally into
   the chat template instead — so jevper moves it to the top-level `system` field, where it cannot be dropped
-  or rejected. All four servers answer `200` for one on this route; the
+  or rejected. All five servers answer `200` for one on this route; the
   `400 System message must be at the beginning.` that vLLM and SGLang give belongs to the *OpenAI* surfaces.
 
 The reasoning parsers matter here too. With thinking left on — vLLM's and SGLang's templates default to it —
 the parser can put the whole generation into a thinking block and return no text block at all, so there is
 nothing to read: a `structured` call raises `MalformedAnswerError`, whose message says the response carried
-reasoning only. Turn thinking off per call exactly as on the other surfaces
-(`extra_body={"chat_template_kwargs": {"enable_thinking": False}}`) — but on this surface in 0.5.3 that body
-only reaches the wire when a `temperature` is set and jevper's own thinking is off, so pass `temperature=0.0`
-beside it or the knob is silently dropped; with that, every scenario on vLLM's
-Messages route answers. SGLang needs one more server-side decision: with `--reasoning-parser qwen3` and a
+reasoning only, or `IncompleteAnswerError` when the trace spent the output budget and the call reports
+`stop_reason: "max_tokens"`. Turn thinking off per call exactly as on the other surfaces
+(`extra_body={"chat_template_kwargs": {"enable_thinking": False}}`, or
+`{"reasoning_effort": "none"}` on ollama) — that body reaches this surface whatever else is on the request,
+so the knob is not silently dropped, and with it vLLM's route answers. It is not enough everywhere: measured
+on 0.6.0, ollama and SGLang still spend a 1024-token budget on a thinking model's trace and return no text,
+so on those two use the OpenAI surfaces or `extra_body={"max_tokens": 2048}`. SGLang needs one more
+server-side decision: with `--reasoning-parser qwen3` and a
 *non-thinking* model, whose template has no `enable_thinking` to set, the parser never sees the closing
 marker it waits for and classifies the whole generation as reasoning — dropping `--reasoning-parser` fixes
 it. That is a property of serving that model with that parser, not of the client.
