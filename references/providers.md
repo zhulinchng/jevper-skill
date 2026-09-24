@@ -147,6 +147,11 @@ accepts `reasoning_effort: "none"` (its `--jinja` template) and `reasoning_budge
 has a per-model `think` setting. `structured` and `discrete` are unaffected by thinking — they read the
 answer text, and the trace lands in `response.reasoning`.
 
+Measured on `qwen3:4b-thinking-2507` through ollama 0.34.3: `extra_body={"reasoning_effort": "none"}` does
+reach the template and does change the answer — to prose (`First …`), which a label readout cannot read, so
+the error names that first token. A thinking model there wants its own `think` setting through ollama's
+native API, or a non-thinking model; a `structured` or `discrete` call is unaffected either way.
+
 A label readout also survives thinking when the server separates the trace *and* the token stream ends
 exactly with the answer text: jevper anchors on that tail and reads the answer's own first token. The
 anchor is strict on purpose, with one allowance — vLLM and SGLang append their end-of-turn token
