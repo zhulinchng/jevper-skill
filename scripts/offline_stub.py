@@ -52,14 +52,19 @@ each call put on the wire — the kwargs with ``extra_body`` merged in, as the S
 ``surfaces`` the endpoint each one went to, in the same order.
 
 Self-test with ``python offline_stub.py --check``; probe a real provider with
-``python offline_stub.py --live --model <id>``.
+``python offline_stub.py --live --model <id>``. The live probe first asks the server what the model
+advertises — OpenRouter's ``/models`` and ``/models/<id>/endpoints`` cost no quota — then spends one call,
+and reports a quota, credit or key failure as what it is rather than as a jevper failure.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
+import sys
+import urllib.request
 from typing import Any
 
 SCENARIOS = (
@@ -998,12 +1003,104 @@ def _run_checks() -> int:
     else:  # pragma: no cover
         check("reasoning_only: the error says the response carried reasoning only", False, "no error")
 
+    # The live probe's own reporting, exercised offline: what a model advertises, and how a failure reads.
+    advertised = _capabilities({"reasoning", "max_tokens", "structured_outputs", "logprobs"})
+    check("live probe: an advertised logprob field is seen before a request is spent",
+          advertised == {"logprobs": True, "schema": "strict"}, str(advertised))
+    bare = _capabilities({"reasoning_effort", "max_tokens"})
+    check("live probe: a model with no logprob and no format field reads as structured-with-no-schema",
+          bare == {"logprobs": False, "schema": "none"}, str(bare))
+    check("live probe: a server that cannot be asked is unknown, never a probe failure",
+          _preflight("", "any") is None and _preflight("http://127.0.0.1:9/v1", "any") is None)
+    quota = _live_failure(ProviderError("Rate limit exceeded: " + "x" * 600, status_code=429,
+                                       attempts=[{"surface": "responses"}] * 3))
+    check("live probe: a 429 reads as a quota answer, not a jevper failure",
+          "HTTP 429" in quota and "quota answer" in quota and "not a jevper failure" in quota, quota)
+    check("live probe: the failure stays one screen, keeping the status and the attempts",
+          len(quota) < 600 and "provider attempts: 3" in quota and "x" * 600 not in quota, str(len(quota)))
+    local = _live_failure(JevperError("prompt_cache_key must be a non-blank string"))
+    check("live probe: a local refusal names no status and points at the triage table",
+          "HTTP" not in local and "troubleshooting.md" in local, local)
+
     print()
     print(f"{'all checks passed' if not failures else f'{failures} check(s) failed'}")
     return 1 if failures else 0
 
 
 # -- live probe --------------------------------------------------------------------------------------
+
+
+_LIVE_REMEDIES = {
+    401: "the key was rejected — check the API key you exported",
+    402: "the account is out of credits — a billing answer, not a jevper failure",
+    403: "the account, the model or a guardrail refused this request; a `:free` id can also be reserved for "
+         "agentic harnesses",
+    404: "the base_url has no such route — check the port and the path",
+    429: "the key or IP is rate-limited, or the account's free-model quota is spent: a quota answer, not a "
+         "jevper failure. Retry later, or probe a model that still has quota",
+}
+
+
+def _capabilities(parameters: set[str]) -> dict[str, Any]:
+    """What a model advertises, mapped onto the two things that decide how jevper reads an answer."""
+    if "structured_outputs" in parameters:
+        schema = "strict"
+    elif "response_format" in parameters:
+        schema = "object"
+    else:
+        schema = "none"
+    return {"logprobs": bool(parameters & {"logprobs", "top_logprobs"}), "schema": schema}
+
+
+def _preflight(base_url: str, model: str) -> dict[str, Any] | None:
+    """Ask the server what the model advertises, before spending a request. Never raises.
+
+    OpenRouter answers ``/models`` with one entry per model and ``/models/<id>/endpoints`` with one entry per
+    upstream provider; a local server usually has only the list, and a hand-rolled one may have neither.
+    Anything unreadable is ``None``: the probe still runs, it just says nothing about capabilities.
+    """
+    root = base_url.rstrip("/")
+    if not root:
+        return None
+    sources = (
+        (f"{root}/models/{model}/endpoints", lambda body: (body.get("data") or {}).get("endpoints")),
+        (f"{root}/models", lambda body: next((m for m in body.get("data") or [] if m.get("id") == model), None)),
+    )
+    for url, pick in sources:
+        body: dict[str, Any] | None = None
+        # An unreadable server is unknown, not a failure: the probe still runs, it just says nothing.
+        with contextlib.suppress(OSError, ValueError), urllib.request.urlopen(url, timeout=5) as response:
+            body = json.loads(response.read())
+        if body is None:
+            continue
+        entries = pick(body)
+        if entries is None:
+            continue
+        parameters: set[str] = set()
+        for entry in entries if isinstance(entries, list) else [entries]:
+            parameters |= set(entry.get("supported_parameters") or [])
+        if parameters:
+            return _capabilities(parameters)
+    return None
+
+
+def _live_failure(exc: Exception) -> str:
+    """One screen saying why the probe failed and what to do, from whatever the error carries."""
+    status = getattr(exc, "status_code", None)
+    attempts = getattr(exc, "attempts", None)
+    said = " ".join(str(exc).split())
+    if len(said) > 240:
+        said = said[:240] + "…"
+    lines = [f"FAILED  {type(exc).__name__}" + (f"  HTTP {status}" if status else "")]
+    if attempts:
+        lines.append(f"  provider attempts: {len(attempts)}")
+    if said:
+        lines.append(f"  provider says: {said}")
+    remedy = _LIVE_REMEDIES.get(status) if status else None
+    if remedy is None and status and 500 <= status < 600:
+        remedy = "the provider is failing — retry, or check the model and provider status"
+    lines.append(f"  next: {remedy or 'no request reached a provider, or none came back — see troubleshooting.md'}")
+    return "\n".join(lines)
 
 
 def _run_live(model: str, api: str) -> int:
@@ -1040,17 +1137,27 @@ def _run_live(model: str, api: str) -> int:
             "sales": "pricing, plans, purchasing, upgrades",
         },
     )
+    # Free where the server offers it: what the model advertises decides the readout before a token is spent.
+    preflight = None
+    if api != "messages":
+        preflight = _preflight(os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1", model)
+        if preflight is not None:  # to stderr, so stdout stays the JSON result
+            print(f"preflight  {model}: logprobs={'yes' if preflight['logprobs'] else 'no'}, "
+                  f"schema={preflight['schema']}", file=sys.stderr)
     client = SystemOneClient(probe_client, model=model, api=api)
     try:
         response = client.system_one(
             state="I was charged twice for the same subscription this month.", questions={"intent": question}
         )
     except JevperError as exc:
-        print(f"FAILED  {type(exc).__name__}: {exc}")
+        print(_live_failure(exc))
         return 1
 
     print(json.dumps({
         "model": response.model,
+        "preflight": preflight,
+        "note": "no advertised logprobs: `auto` reads this model with `structured`, never a distribution"
+        if preflight is not None and not preflight["logprobs"] else None,
         "method_per_question": response.debug.get("methods", response.debug["method"]),
         "api": response.debug["api"],
         "readout_source": response.debug["llm_attempts"][-1]["readout"]["source"],

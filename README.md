@@ -27,7 +27,7 @@ Written and verified against **jevper 0.5.2** (Python 3.10+, `pydantic>=2.7`). E
 - **Async**: `AsyncSystemOneClient`, same signatures, semaphore instead of thread pool
 - **Client knobs**: `temperature`, `top_logprobs`, `structured_outputs`, `prompt_cache_key`, `normalize_probabilities`, `max_concurrency`, `n_retry_malformed`, `retry`, `api`
 - **Failure triage**: which errors are local (zero requests sent), which are readout failures worth one corrective retry, which are `ProviderError`; transient retry policy; answers that ended early — or carried reasoning only — and say why; the `debug` keys that show what actually happened
-- **Offline testing**: a duck-typed stub client that drives the real readout path from canned bodies — no HTTP, no key, no tokens
+- **Offline testing**: a duck-typed stub client that drives the real readout path from canned bodies — no HTTP, no key, no tokens — plus a live probe that reads what a model advertises before it spends a call
 
 ## Layout
 
@@ -43,10 +43,16 @@ Written and verified against **jevper 0.5.2** (Python 3.10+, `pydantic>=2.7`). E
 pip install jevper                                 # Python 3.10+, pydantic>=2.7; 0.5.2 or newer
 python scripts/offline_stub.py --check             # offline self-test: no network, no API key
 python scripts/offline_stub.py --live --model <id> # needs openai + OPENAI_API_KEY; OPENAI_BASE_URL for self-hosted
+                                         # reads the model's advertised parameters first (free, no quota), then spends one call
 python scripts/offline_stub.py --live --model <id> --api messages   # needs anthropic; ANTHROPIC_BASE_URL for a local server
 ```
 
-The self-test drives `StubClient` through the real jevper readout path: the logprobs softmax, the structured JSON readout, `auto`'s per-`(model, surface)` memory, the surface move when a provider refuses logprobs or a route is missing — under `auto` and under a pinned `method="logprobs"`, with a single-surface client kept on the surface it has, the server-limits ladder (`json_schema` → `json_object` → nothing, the Messages `thinking` field, and the rung a refused format field skips), a refused `prompt_cache_key`, a refused *value* that travels back as the provider's error, the schema that travels in the prompt when the request cannot carry one, a caller's `extra_body` winning over jevper's own default, the derived cache key (method included) and `cached_tokens` on all three usage paths, the message order — including a state ending on the assistant's turn, the `LabelReadoutError` a pinned `logprobs` raises against a provider that cannot do them, the message a truncated answer carries on every surface, the refusal a pinned label readout gets on the Messages surface, the error a reasoning-only answer carries, and two-step reasoning on the chat surface. The live probe prints which method a real provider resolves to, the surface, the readout source, `cached_tokens` and any server limits — run it before writing an integration against a new model.
+`--live` prints a JSON report: what the model advertises, the resolved method per question, the surface used,
+the readout source, `n_calls`, `cached_tokens`, `server_limits` and `retry_reasons`. A quota, credit or key
+refusal is reported as the account answer it is — status, the provider's own words, and the next step — so a
+`429` from an exhausted free-model quota never reads as a jevper failure.
+
+The self-test drives `StubClient` through the real jevper readout path: the logprobs softmax, the structured JSON readout, `auto`'s per-`(model, surface)` memory, the surface move when a provider refuses logprobs or a route is missing — under `auto` and under a pinned `method="logprobs"`, with a single-surface client kept on the surface it has, the server-limits ladder (`json_schema` → `json_object` → nothing, the Messages `thinking` field, and the rung a refused format field skips), a refused `prompt_cache_key`, a refused *value* that travels back as the provider's error, the schema that travels in the prompt when the request cannot carry one, a caller's `extra_body` winning over jevper's own default, the derived cache key (method included) and `cached_tokens` on all three usage paths, the message order — including a state ending on the assistant's turn, the `LabelReadoutError` a pinned `logprobs` raises against a provider that cannot do them, the message a truncated answer carries on every surface, the refusal a pinned label readout gets on the Messages surface, the error a reasoning-only answer carries, two-step reasoning on the chat surface, and the live probe's own capability read and failure reporting.
 
 ## Reference
 

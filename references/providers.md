@@ -40,6 +40,20 @@ It prints the resolved method per question, the surface actually used, the reado
 `usage.cached_tokens` and `debug["server_limits"]` for one real call. The `messages` probe needs the
 `anthropic` package and `ANTHROPIC_BASE_URL` (or `OPENAI_BASE_URL`) for a local server.
 
+The probe asks the server what the model advertises *before* spending a call — `GET {base_url}/models`, and
+OpenRouter's per-provider `GET {base_url}/models/<id>/endpoints`, neither of which counts against a request
+quota — and prints `preflight` (logprobs? a strict schema? a plain `json_object`? neither?). A model
+advertising no logprob field is read with `structured`; one advertising no format field also loses the
+schema, and the shape then rests on the prompt alone.
+
+A quota, credit or key refusal is reported as what it is — the status, the provider's own words (truncated),
+and the next step — because it is not a jevper failure. On OpenRouter that means: `free-models-per-day` is
+one **account-wide** cap, 50 requests/day with no credits and 1000 once $10 or more is purchased, reset
+midnight UTC, so a different `:free` model id does not get around an exhausted cap; a few `:free` ids answer
+`403` because they are reserved for agentic harnesses; and `402` means the account is out of credits.
+`429` and `503` may carry `Retry-After`, which the OpenAI and Anthropic SDKs honour on their own — jevper
+does not read it.
+
 ## Surfaces
 
 `api="auto"` (the default) prefers the Responses surface, which carries native reasoning and encrypted
@@ -62,6 +76,9 @@ Neither OpenAI builder ever sends `max_tokens`, `max_completion_tokens` or `max_
 tokens count against those caps, and a small cap silently truncates a reasoning model. The Messages
 protocol is the exception — it has no server-side default, so jevper always sends one there and
 `extra_body={"max_tokens": n}` overrides it. Anything else provider-specific goes through `extra_body` too.
+
+OpenRouter's Responses API is stateless — `store: true` or a `previous_response_id` is a `400` — so the
+`store=false` jevper already sends is the form it accepts, and the whole history travels in `input` each call.
 
 Where a request cannot state the answer's shape — the Messages API has no schema field, and a server that
 refuses the strict schema is re-asked with a plain JSON object — jevper appends the JSON Schema to the
@@ -90,8 +107,8 @@ A client object cannot say whether the *server* implements a route — `openai.O
 When a server refuses a request field jevper added — `response_format`, `text.format`, `reasoning_effort`,
 `reasoning`, the `include` list, `prompt_cache_key`, or the Messages `thinking` field — the field is dropped
 and the same call re-asked, one step down the ladder at a time (`json_schema` → `json_object` → nothing),
-remembered per surface and reported in `debug["server_limits"]`. None of them is needed to answer the
-question.
+remembered per surface and reported in `debug["server_limits"]` for the surface that answered. None of them
+is needed to answer the question.
 
 ## Local servers
 
@@ -159,7 +176,8 @@ fits a 12 GB card.
 Every server here also implements the Anthropic Messages API (`POST /v1/messages`), so `api="messages"`
 works against each of them: an `anthropic.Anthropic` client pointed at the same host and port as the OpenAI
 one, passed in place of it. What differs is how much of the protocol each implements — the version is the
-first release that ships the route. LM Studio and OpenRouter serve it too.
+first release that ships the route. LM Studio serves it too, and OpenRouter implements it as its Anthropic
+skin (`ANTHROPIC_BASE_URL=https://openrouter.ai/api`, documented by OpenRouter rather than measured here).
 
 | Server | Since | `thinking` field | Thinking blocks back | `usage` cache counts |
 | --- | --- | --- | --- | --- |

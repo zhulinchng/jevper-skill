@@ -146,7 +146,7 @@ Check what actually happened before debugging blind:
 response.debug["method"]                                  # what auto resolved to, or what you pinned
 response.debug["methods"]                                 # {"intent": "structured"} — auto only
 response.debug["api"]                                     # "chat_completions" | "responses" | "messages"
-response.debug["server_limits"]                           # fields the server refused, once it has refused any
+response.debug["server_limits"]                           # fields the *answer's* surface refused, else absent
 response.debug["llm_attempts"][-1]["readout"]["source"]   # which readout produced the final answer
 response.usage.n_calls                                    # answered calls: +analysis passes, +corrective retries
 response.usage.cached_tokens                              # what the provider read from its prompt cache
@@ -172,9 +172,9 @@ calls route to the same cache, and both passes of a two-step call share one key.
 `usage.cached_tokens` is what the provider read from its cache, `None` when it said nothing, and `0` for a
 cold or disabled one: vLLM reports it only with `--enable-prompt-tokens-details`, SGLang's Chat route only
 with `--enable-cache-report`, and llama.cpp/ollama always. A server that refuses the field has it dropped
-and the call re-asked, reported in `debug["server_limits"]["cache_key"]`. Each surface reports it under its
-own name (`prompt_tokens_details`, `input_tokens_details`, or Anthropic's `cache_read_input_tokens`), and
-jevper reads all three into `usage.cached_tokens`.
+and the call re-asked, reported in `debug["server_limits"]["cache_key"]` on the surface that answered. Each
+surface reports it under its own name (`prompt_tokens_details`, `input_tokens_details`, or Anthropic's
+`cache_read_input_tokens`), and jevper reads all three into `usage.cached_tokens`.
 
 Per-server reporting, the measured reuse, and isolating a cache with `extra_body={"cache_salt": ...}`:
 [references/providers.md](references/providers.md).
@@ -202,8 +202,10 @@ own `@mlflow.trace` one. [references/features.md](references/features.md#tracing
 A server that refuses a field jevper added for capability does not fail the call: `response_format` (or
 `text.format`) walks `json_schema` → `json_object` → nothing, then the reasoning parameters, then the
 Responses `include` list, then `prompt_cache_key`, then the Messages `thinking` field. Each rung is
-remembered for that surface and reported in `debug["server_limits"]`, and the question is still answered —
-with a fresh retry budget, since the attempts the old request shape spent say nothing about the new one.
+remembered for that surface, and the question is still answered — with a fresh retry budget, since the
+attempts the old request shape spent say nothing about the new one. `debug["server_limits"]` reports the
+rungs of the surface the *answer* came from, so a refusal on a surface jevper later left is narrated in
+`debug["retry_reasons"]` instead — read both when a ladder step seems to be missing.
 Only a complaint about the field's *existence* moves the ladder: a refusal of the value
 (`budget_tokens: must be at least 1024`) travels back as the provider's own error. A capability field you
 named in `extra_body` is dropped with jevper's own — the SDK merges `extra_body` last, so leaving it there
@@ -258,7 +260,10 @@ Scenarios: `logprobs`, `structured`, `reject_logprobs`, `reject_include`, `no_al
 `python scripts/offline_stub.py --check` from the skill directory for a self-test, and
 `python scripts/offline_stub.py --live --model <id>` (add `--api messages` for an Anthropic-compatible
 server) with real credentials to see which method that provider actually resolves to, on which surface,
-before writing a line of your own.
+before writing a line of your own. The live probe asks the server what the model advertises first — free,
+outside any request quota — and a `429`, `402` or `401` is reported as the account answer it is, not as a
+jevper failure. [references/providers.md](references/providers.md#does-this-provider-do-logprobs) has the
+matrix and what each quota means.
 
 ## Checklist
 

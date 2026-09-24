@@ -63,7 +63,7 @@ produced a response.
 | `method` | the effective method: what `auto` resolved to, or what you pinned |
 | `methods` | `{question_id: method}` — present only under `auto`, since it chooses per question |
 | `api` | the surface actually used: `chat_completions`, `responses` or `messages` |
-| `server_limits` | present once the server refused a field: `{"structured": "schema"|"object"|"none", "reasoning": bool, "include": bool, "cache_key": bool, "thinking": bool}` — the call was re-asked without them |
+| `server_limits` | the fields the surface the **answer** came from refused: `{"structured": "schema"|"object"|"none", "reasoning": bool, "include": bool, "cache_key": bool, "thinking": bool}` — the call was re-asked without them. A refusal on a surface jevper later left is in `retry_reasons`, not here |
 | `reasoning_mode` | `off`, `native` or `two_step` |
 | `llm_attempts` | one record per provider call: `question_id`, `surface`, `request` (the exact kwargs sent, or about to be sent), `response`, `error` (`"Type: message"`), `readout` |
 | `readout.source` | which readout produced the answer: `logprobs`, `structured` or `discrete` |
@@ -91,7 +91,7 @@ is `None` when any constituent call omitted it — a reported `0` is preserved.
 | `400 Unknown name "logprobs"` (Gemini's OpenAI-compatibility endpoint) | same — the endpoint never had logprobs; `auto` falls back |
 | `LabelReadoutError: no logprobs returned …` | the provider ignored the fields; check the model id and endpoint, then let `auto` fall back |
 | `LabelReadoutError: … no alternatives …` | `top_logprobs` is `0`, or the provider reports only the sampled token: raise it, or accept `structured` |
-| `400` naming `response_format`, `json_schema`, `text.format`, `reasoning_effort`, `include`, `prompt_cache_key` or `thinking` | absorbed automatically — the field is dropped, the call re-asked, and `debug["server_limits"]` records what the server refused. Nothing to fix |
+| `400` naming `response_format`, `json_schema`, `text.format`, `reasoning_effort`, `include`, `prompt_cache_key` or `thinking` | absorbed automatically — the field is dropped, the call re-asked, and `debug["server_limits"]` records what the answering surface refused. Nothing to fix |
 | `400 budget_tokens: must be at least 1024`, or another complaint about the *number* in a field the server knows | not absorbed, on purpose: the provider's own error travels back rather than the call being re-asked with your reasoning silently switched off. Send a value that server accepts (Anthropic's floor is 1024, and the budget must stay below `max_tokens`) |
 | `JevperError: prompt_cache_key must be …` | the key is checked before any request: pass a non-blank string of at most 256 characters |
 | `UnsupportedMethodError` on an Anthropic-compatible client | that API has no logprobs: use `structured`/`discrete`, or an OpenAI-compatible client for a label readout. `auto` already answers in JSON there |
