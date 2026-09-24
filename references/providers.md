@@ -8,7 +8,7 @@
 
 ## Does this provider do logprobs?
 
-Observed against each provider's live API, as of jevper 0.5.0 — providers move, so treat a row as a
+Observed against each provider's live API, as of jevper 0.5.1 — providers move, so treat a row as a
 starting point rather than a law, and let `auto` verify it per `(model, surface)` for you.
 
 | Provider | `logprobs` | Note |
@@ -147,9 +147,9 @@ first release that ships the route. LM Studio and OpenRouter serve it too.
 | Server | Since | `thinking` field | Thinking blocks back | `usage` cache counts |
 | --- | --- | --- | --- | --- |
 | LM Studio | 0.4.1 | accepted, answer still separated from it | `thinking` blocks when the model thinks | `cache_read_input_tokens`, including a reported `0` on a cold call |
-| llama.cpp | b7187 | accepted | reported | not documented |
-| vLLM | 0.11.1 | **absent from its protocol**: the request is refused, jevper drops the field and re-asks | `thinking` blocks | yes |
-| SGLang | 0.5.9 | accepted, including `type: enabled/disabled/adaptive` | `thinking` blocks | yes |
+| llama.cpp | b7187 | accepted, and the budget grows `max_tokens` as below | reported | not documented |
+| vLLM | 0.11.1 | **accepted and ignored**: its request model has no `thinking` field and pydantic drops the extra, so no downgrade fires and the answer comes back with no thinking and no way to tell | `thinking` blocks | yes |
+| SGLang | 0.5.9 | **refused**: this version has no `thinking` field at all, so the request is answered `400` and jevper drops the field and re-asks | `thinking` blocks | yes |
 | ollama | 0.14.0 | accepted, but `budget_tokens` is **not enforced** | `thinking` blocks | no cache fields at all |
 
 Four protocol facts shape what the client does on this surface:
@@ -160,12 +160,19 @@ Four protocol facts shape what the client does on this surface:
 - **No schema field either**, so `structured`/`discrete` carry the JSON Schema in the system prompt, and the
   answer's shape is only as good as the model's instruction-following.
 - **`max_tokens` is required** by vLLM's and SGLang's implementations and has no default on any of them, so
-  jevper always sends one (`1024`, or `extra_body={"max_tokens": n}`). Thinking is a budget, not an effort
-  name: `ReasoningConfig(mode="native", budget_tokens=n)` sends `thinking={"type": "enabled", ...}`, and
-  `effort` is never translated into one.
-- **A `system` role inside `messages` is not part of the API**, so jevper moves it to the top-level `system`
-  field. All four servers answer `200` for one on this route; the `400 System message must be at the
-  beginning.` that vLLM and SGLang give belongs to the *OpenAI* surfaces.
+  jevper always sends one: `1024`, or `1024` plus the caller's `ReasoningConfig(budget_tokens=n)`, because
+  this API also requires the thinking budget to be strictly *below* `max_tokens` and would refuse the 1024
+  its own documentation calls the floor. `extra_body={"max_tokens": n}` wins outright. Measured on all five:
+  a 1024 budget sends `max_tokens: 2048`, a 2048 budget sends `3072`. Thinking is a budget, not an effort
+  name: `ReasoningConfig(budget_tokens=n)` sends `thinking={"type": "enabled", ...}` and `effort` is never
+  translated into one. A server that refuses the *value* (`budget_tokens: must be at least 1024`) keeps its
+  own error rather than being re-asked with your reasoning silently switched off; one that does not know the
+  field at all has it dropped and the call re-asked, reported in `debug["server_limits"]["thinking"]`.
+- **A `system` role inside `messages` is not part of the API** — Anthropic has since added mid-conversation
+  `system` messages, but none of these servers implements them, rendering a `system` turn positionally into
+  the chat template instead — so jevper moves it to the top-level `system` field, where it cannot be dropped
+  or rejected. All four servers answer `200` for one on this route; the
+  `400 System message must be at the beginning.` that vLLM and SGLang give belongs to the *OpenAI* surfaces.
 
 The reasoning parsers matter here too. With thinking left on — vLLM's and SGLang's templates default to it —
 the parser can put the whole generation into a thinking block and return no text block at all, so there is

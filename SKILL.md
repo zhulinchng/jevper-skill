@@ -13,7 +13,7 @@ hosted models and self-hosted llama.cpp/vLLM/Ollama/SGLang servers work the same
 rendered last so a rubric's prompts share a cacheable prefix. `openai` and `anthropic` are not runtime
 dependencies; `pydantic>=2.7` is. Python 3.10+.
 
-Written against jevper 0.5.0; if you are on a newer release, check its `docs/` — the library is the
+Written against jevper 0.5.1; if you are on a newer release, check its `docs/` — the library is the
 authority.
 
 ## Quick start
@@ -87,6 +87,10 @@ things count as "this provider cannot do logprobs" — a 4xx that names the logp
 logprobs at all, or an answer token with no alternatives. A rejection that complains only about a *value*
 (a server whose `top_logprobs` cap is lower than 20) still falls back for that question but is not
 remembered, and a 5xx that survives retries falls back for that question alone without moving anything.
+The same distinction decides the capability ladder below: a server that refuses the *number* in a field it
+knows — `budget_tokens: must be at least 1024`, `reasoning_effort must be one of low, medium, high` — keeps
+its own error instead of having the field dropped, because answering with your reasoning quietly switched
+off is worse than failing loudly.
 
 Before giving up on logprobs, `auto` tries the other surface when the client exposes one and the reasoning
 mode is not `native`, because a server can implement a route and still not carry logprobs through it
@@ -100,9 +104,11 @@ requests the provider rejected are not counted in `usage.n_calls`.
 readout: no logprobs exist in that API, so `auto` answers with `structured` there without spending a call,
 and a pinned `logprobs`/`grammar` raises `UnsupportedMethodError` before any request. It has no schema field
 either, so the JSON Schema travels in the system prompt (set `temperature=0.0` there); `max_tokens` is
-required and jevper sends `1024` unless `extra_body` overrides it; and thinking is a budget —
-`ReasoningConfig(mode="native", budget_tokens=n)` — where a server without the field (vLLM's) has it dropped
-and the call re-asked.
+required and jevper sends `1024` — plus your thinking budget, since this API wants the budget strictly
+*below* `max_tokens` — unless `extra_body={"max_tokens": n}` overrides both. Thinking is a budget here,
+`ReasoningConfig(budget_tokens=n)`, which `mode="auto"` selects on its own on this surface; a server that
+does not know the field at all (SGLang's) has it dropped and the call re-asked, while one that refuses the
+number gets its own error back.
 
 Know the refusals by sight, and let the probe in
 [Test without spending tokens](#test-without-spending-tokens) settle a new endpoint in one call:
@@ -147,12 +153,16 @@ len(response.debug["llm_attempts"])                       # every provider attem
 The prompt is assembled in cache order — system prompt, few-shot turns, question block, state turns — so
 the part that changes between calls, the state, comes last and a rubric's calls share everything before it.
 That is what makes a re-ask with a different state cheap, and what gets a prompt over the 1024-token
-minimum a hosted API caches from.
+minimum a hosted API caches from. One shape is the exception: a chat-list state whose own last turn is the
+assistant's, which no server reads as a question (the llama.cpp engines answer
+`400 Failed to initialize samplers`), so the question goes last there and that prefix is not reusable.
 
 Every request carries a `prompt_cache_key`: yours if you passed one (`prompt_cache_key=` on the client or
 the call; a non-blank string of at most 256 characters, else `JevperError` before any request is sent), or
-one derived per question from the model, the example turns and the question block. The state is not part of
-it, so one rubric's calls route to the same cache, and both passes of a two-step call share one key.
+one derived per question from the model, the method, the example turns and the question block — the method
+belongs in it because its system prompt and answer shape are part of the cached prefix, so a `logprobs`
+request must not be routed into a `structured` one's bucket. The state is not part of it, so one rubric's
+calls route to the same cache, and both passes of a two-step call share one key.
 
 `usage.cached_tokens` is what the provider read from its cache, `None` when it said nothing, and `0` for a
 cold or disabled one: vLLM reports it only with `--enable-prompt-tokens-details`, SGLang's Chat route only
@@ -170,9 +180,9 @@ Three groups, and only the middle one is worth catching for control flow:
 
 | Error | Raised when | What to do |
 | --- | --- | --- |
-| `InvalidQuestionError`, `UnsupportedMethodError`, `ClientCapabilityError` | before any request: bad question or example, `grammar` on the wrong surface or `logprobs`/`grammar` on the Messages surface, client missing the attribute a surface needs, or a response with no choices and no explanation | fix the code — these cost nothing and never need a retry |
+| `InvalidQuestionError`, `UnsupportedMethodError`, `ClientCapabilityError` | before any request: bad question or example (every example is checked up front, before the first call), `grammar` on the wrong surface or `logprobs`/`grammar` on the Messages surface, client missing the attribute a surface needs, or a response with no usable first choice and no explanation | fix the code — these cost nothing and never need a retry |
 | `LabelReadoutError`, `MalformedAnswerError` | the answer could not be read; retried once by default (`n_retry_malformed`) with a correction turn | usually leave it alone; `auto` turns the provider-side cases into `structured` instead |
-| `ProviderError` | a provider call failed after transient retries; `.attempts` and `.status_code` hold the history, including a status carried inside a `200` body (OpenRouter) | the only one worth a retry loop of your own, and the one to catch at a service boundary |
+| `ProviderError` | a provider call failed after transient retries; `.attempts` and `.status_code` hold the history, including a status carried inside a `200` body (OpenRouter), and it is also what you get when every surface `auto` could try answered `404` — a missing route is the provider's failure, not a verdict jevper keeps | the only one worth a retry loop of your own, and the one to catch at a service boundary |
 
 `JevperError` is the base class — catch it if you want one handler for everything, including constructor
 misuse, a bad `state` message, and content that is not JSON-serializable or carries a non-finite number.
@@ -183,8 +193,14 @@ transport errors) are retried per call with `RetryPolicy(n_retries=2, base_delay
 A server that refuses a field jevper added for capability does not fail the call: `response_format` (or
 `text.format`) walks `json_schema` → `json_object` → nothing, then the reasoning parameters, then the
 Responses `include` list, then `prompt_cache_key`, then the Messages `thinking` field. Each rung is
-remembered for that surface and reported in `debug["server_limits"]`, and the question is still answered.
-The ladder is finite, so a server that refuses everything still ends in `ProviderError`.
+remembered for that surface and reported in `debug["server_limits"]`, and the question is still answered —
+with a fresh retry budget, since the attempts the old request shape spent say nothing about the new one.
+Only a complaint about the field's *existence* moves the ladder: a refusal of the value
+(`budget_tokens: must be at least 1024`) travels back as the provider's own error. A capability field you
+named in `extra_body` is dropped with jevper's own — the SDK merges `extra_body` last, so leaving it there
+would send the refused bytes again — and with `structured_outputs=False` the request already carried a
+plain `json_object`, so that rung is skipped. The ladder is finite, so a server that refuses everything
+still ends in `ProviderError`.
 
 Three traps worth knowing:
 
@@ -196,18 +212,22 @@ Three traps worth knowing:
   error in `debug["probability_errors"]`). Set `temperature=0.0` there; sampling noise moves them directly.
 - **An answer that never arrived says why.** A reasoning model can spend the whole output budget thinking,
   and the error text then names the stop reason (`finish_reason: 'length'` /
-  `incomplete_details.reason: 'max_output_tokens'`) and suggests `extra_body={"max_tokens": ...}` — nobody
-  sends those caps, so raise it and turn thinking off too. When a reasoning parser swallowed the whole
-  generation into a thinking block and returned no answer text, the same error says the response carried
-  reasoning only: a server-side deployment setting, not something another retry fixes.
+  `incomplete_details.reason: 'max_output_tokens'` / `stop_reason: 'max_tokens'`) and suggests
+  `extra_body={"max_tokens": ...}` — nobody sends those caps, so raise it and turn thinking off too. A
+  model that *refused* reads as a refusal rather than as malformed JSON: OpenAI reports it in a `refusal`
+  sibling of a null `content`, the Messages API as `stop_reason: 'refusal'`, and the message carries the
+  model's own words where the surface has them. When a reasoning parser swallowed the whole generation into
+  a thinking block and returned no answer text, the same error says the response carried reasoning only: a
+  server-side deployment setting, not something another retry fixes.
 
 ## Test without spending tokens
 
 `scripts/offline_stub.py` is a duck-typed client that answers from canned bodies — no HTTP, no key — while
 the real readout path (logprobs softmax, structured JSON, `auto`'s fallback and surface move, the
-server-limits ladder, the schema that travels in the prompt when the request cannot carry one) runs end to
-end. Its `surface=` knob picks which endpoints the fake client exposes: `chat_completions`, `responses`,
-`messages` (the Anthropic shape) or `both`.
+server-limits ladder and the refusals it does not absorb, the schema that travels in the prompt when the
+request cannot carry one, the message a truncated or refused answer carries) runs end to end. Its `surface=`
+knob picks which endpoints the fake client exposes: `chat_completions`, `responses`, `messages` (the
+Anthropic shape) or `both`.
 
 ```python
 import sys
@@ -224,7 +244,8 @@ assert stub.requests[0]["logprobs"] is True                  # and it did ask fo
 ```
 
 Scenarios: `logprobs`, `structured`, `reject_logprobs`, `no_alternatives`, `no_responses_route`,
-`reject_schema`, `reject_cache_key`, `reject_thinking`, `truncated`, `reasoning`, `reasoning_only`. Run
+`reject_schema`, `reject_format`, `reject_cache_key`, `reject_thinking`, `reject_budget_value`,
+`truncated`, `refusal`, `reasoning`, `reasoning_only`. Run
 `python scripts/offline_stub.py --check` from the skill directory for a self-test, and
 `python scripts/offline_stub.py --live --model <id>` (add `--api messages` for an Anthropic-compatible
 server) with real credentials to see which method that provider actually resolves to, on which surface,

@@ -24,10 +24,17 @@ Scenarios:
     no_alternatives      a provider that reports the sampled token and nothing else
     no_responses_route   a server that answers 404 for /v1/responses — a missing route, not a bad model
     reject_schema        a server that answers 400 to a strict JSON schema, and accepts ``json_object``
+    reject_format        a server with no format field at all: it refuses ``json_object`` too, so the
+                         ladder has one rung fewer to walk
     reject_cache_key     a server that answers 400 to ``prompt_cache_key``
-    reject_thinking      a server whose protocol has no Messages ``thinking`` field (vLLM's route)
+    reject_thinking      a server whose protocol has no Messages ``thinking`` field (SGLang's route)
+    reject_budget_value  a server that refuses the thinking budget's *value* (``budget_tokens: must be
+                         at least 1024``): a field it knows, so nothing is dropped and the provider's
+                         own error travels back
     truncated            a reasoning model that spent the whole output budget thinking: no answer, and a
-                         stop reason that says so
+                         stop reason that says so (``max_tokens`` on the Messages surface)
+    refusal              a model that refuses instead of answering: OpenAI's ``refusal`` sibling of a
+                         null ``content``, the Messages API's ``stop_reason: "refusal"``
     reasoning            a chat-surface two-step sequence: analysis text, then the answer
     reasoning_only       a server whose reasoning parser put the whole generation in a thinking block:
                          no answer text at all
@@ -36,8 +43,9 @@ Knobs: ``surface`` (``chat_completions``, ``responses``, ``messages`` or ``both`
 endpoints this client exposes, as ``openai.OpenAI`` exposes the first two and ``anthropic.Anthropic`` the
 third), ``winner`` (index into the label alphabet of the option the stub prefers), ``alternatives`` (labels
 reported alongside the answer; 1 means "no distribution") and ``cached_tokens`` (what the server reports as
-read from its prompt cache; ``None`` models a server that says nothing about it). ``requests`` records the
-kwargs of every call and ``surfaces`` the endpoint each one went to, in the same order.
+read from its prompt cache; ``None`` models a server that says nothing about it). ``requests`` records what
+each call put on the wire — the kwargs with ``extra_body`` merged in, as the SDK merges it — and
+``surfaces`` the endpoint each one went to, in the same order.
 
 Self-test with ``python offline_stub.py --check``; probe a real provider with
 ``python offline_stub.py --live --model <id>``.
@@ -57,9 +65,12 @@ SCENARIOS = (
     "no_alternatives",
     "no_responses_route",
     "reject_schema",
+    "reject_format",
     "reject_cache_key",
     "reject_thinking",
+    "reject_budget_value",
     "truncated",
+    "refusal",
     "reasoning",
     "reasoning_only",
 )
@@ -69,6 +80,7 @@ LABELS = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")  # jevper's single-letter label alp
 ANSWER_LOGPROB = -0.1  # the sampled label; alternatives trail it, so the softmax is decisive
 ANALYSIS = "The message is about a duplicate charge, so it concerns money."
 TRACE = "The user says they were charged twice, so this is about money."
+REFUSAL = "I cannot help with that."  # a model's own words for a refusal, as OpenAI reports them
 SIGNATURE = "sig-stub"  # what an Anthropic thinking block carries for a later replay
 SCHEMA_MARKER = "JSON Schema:\n"  # jevper puts the schema in the prompt when the request cannot carry it
 PROMPT_TOKENS = 2388  # the measured prompt in jevper's docs/local-servers.md
@@ -182,6 +194,7 @@ def _usage(cached: int | None = None) -> dict[str, Any]:
 def _chat_body(
     kwargs: dict[str, Any], *, text: str | None = None, body: dict[str, Any] | None = None,
     entries: list[dict[str, Any]] | None = None, stop: str | None = None, cached: int | None = None,
+    refusal: str | None = None,
 ) -> dict[str, Any]:
     if body is not None:
         content = json.dumps(body)
@@ -191,9 +204,13 @@ def _chat_body(
         content = entries[0]["token"]
     else:
         content = ""  # nothing reported: the readout fails on the missing logprobs, as it should
+    message: dict[str, Any] = {"role": "assistant", "content": content}
+    if refusal is not None:
+        # OpenAI's shape for a refusal: the model's words sit beside a null ``content``.
+        message = {"role": "assistant", "content": None, "refusal": refusal}
     choice: dict[str, Any] = {
         "index": 0,
-        "message": {"role": "assistant", "content": content},
+        "message": message,
         "finish_reason": stop or "stop",  # "length": the output budget ran out mid-answer
     }
     if entries is not None:
@@ -337,6 +354,12 @@ class StubClient:
         return [{"token": answer, "logprob": ANSWER_LOGPROB, "top_logprobs": tops}]
 
     def reply(self, kwargs: dict[str, Any], surface: str) -> dict[str, Any]:
+        # The SDK merges ``extra_body`` into the request *after* the typed parameters, so what reaches
+        # the wire is the union with the caller's keys winning. Record that rather than the SDK's calling
+        # convention: a check asking what the server saw should not have to merge it itself.
+        extra = kwargs.pop("extra_body", None)
+        if isinstance(extra, dict):
+            kwargs = {**kwargs, **extra}
         self.requests.append(kwargs)
         self.surfaces.append(surface)
 
@@ -346,12 +369,19 @@ class StubClient:
 
         schema = _requested_schema(kwargs) or _prompt_schema(kwargs)
         if self.scenario == "reject_schema" and _requested_schema(kwargs) is not None:
+            # The strict schema is refused; ``json_object`` is not, so the ladder has all three rungs.
+            raise Rejection("response_format is not supported by this server.")
+        if self.scenario == "reject_format" and ("response_format" in kwargs or "text" in kwargs):
+            # A server with no format field at all: it refuses ``json_object`` as well as a schema.
             raise Rejection("response_format is not supported by this server.")
         if self.scenario == "reject_cache_key" and kwargs.get("prompt_cache_key") is not None:
             raise Rejection("prompt_cache_key is not supported by this server.")
         if self.scenario == "reject_thinking" and kwargs.get("thinking") is not None:
-            # vLLM's protocol has no ``thinking`` field: the request is refused, and jevper drops it.
+            # SGLang's protocol has no ``thinking`` field: the request is refused, and jevper drops it.
             raise Rejection("thinking is not supported by this server.")
+        if self.scenario == "reject_budget_value" and kwargs.get("thinking") is not None:
+            # SGLang again, but refusing the number rather than the field: not a capability verdict.
+            raise Rejection("budget_tokens: must be at least 1024")
         if self.scenario == "reject_logprobs" and _wants_logprobs(kwargs):
             raise Rejection()
 
@@ -362,8 +392,20 @@ class StubClient:
         }[surface]
 
         if self.scenario == "truncated":
-            # Generation stopped before an answer existed — the stop reason is the actionable fact.
+            # Generation stopped before an answer existed — the stop reason is the actionable fact, and
+            # each surface spells it its own way. On the Messages surface thinking is a budget, so this
+            # is what a spent budget with thinking on looks like there: a thinking block, no text.
+            if surface == "messages":
+                return _messages_body(kwargs, thinking=TRACE, stop="max_tokens", cached=self.cached_tokens)
             return body(kwargs, text="", stop="length", cached=self.cached_tokens)
+
+        if self.scenario == "refusal":
+            # A refusal instead of an answer. Only the Chat surface carries the model's own words.
+            if surface == "chat_completions":
+                return _chat_body(kwargs, refusal=REFUSAL, cached=self.cached_tokens)
+            if surface == "messages":
+                return _messages_body(kwargs, stop="refusal", cached=self.cached_tokens)
+            return _responses_body(kwargs, text="", stop="refusal", cached=self.cached_tokens)
 
         if self.scenario == "reasoning_only":
             # The reasoning parser classified the whole generation as thinking: no text block to read.
@@ -396,6 +438,7 @@ def _run_checks() -> int:
         JevperError,
         LabelReadoutError,
         MalformedAnswerError,
+        ProviderError,
         ReasoningConfig,
         SystemOneClient,
         UnsupportedMethodError,
@@ -587,6 +630,42 @@ def _run_checks() -> int:
     else:
         check("caching: a blank key is refused before any request", False, "no error")
 
+    # The method belongs in the key too: its system prompt and answer shape are part of the cached prefix,
+    # so a logprobs request must not be routed into a structured one's bucket.
+    stub = StubClient(scenario="logprobs", surface="chat_completions")
+    client = SystemOneClient(stub, model="stub-model")
+    client.system_one(state=state, questions={"intent": question()}, method="logprobs")
+    client.system_one(state=state, questions={"intent": question()}, method="structured")
+    keys = [request.get("prompt_cache_key") for request in stub.requests]
+    check("caching: the method is part of the key",
+          len(keys) == 2 and keys[0] != keys[1] and all(key.startswith("jevper-") for key in keys),
+          str(keys))
+
+    # Message order: the state goes last so one rubric's requests share a cacheable prefix — except when
+    # the state's own last turn is the assistant's, which no server will read as a question.
+    stub = StubClient(scenario="structured", surface="chat_completions")
+    SystemOneClient(stub, model="stub-model", method="structured").system_one(
+        state=state, questions={"intent": question()}
+    )
+    turns = stub.requests[0]["messages"]
+    check("message order: the state goes last, the question before it",
+          turns[-1]["role"] == "user" and state in turns[-1]["content"],
+          str([message.get("role") for message in turns]))
+
+    stub = StubClient(scenario="structured", surface="chat_completions")
+    SystemOneClient(stub, model="stub-model", method="structured").system_one(
+        state=[
+            {"role": "user", "content": "Where is my refund?"},
+            {"role": "assistant", "content": "Let me look that up."},
+        ],
+        questions={"intent": question()},
+    )
+    turns = stub.requests[0]["messages"]
+    closing = [index for index, message in enumerate(turns) if message.get("content") == "Let me look that up."]
+    check("message order: a state ending on the assistant's turn still ends on the question",
+          turns[-1]["role"] == "user" and closing and closing[0] == len(turns) - 2,
+          str([message.get("role") for message in turns]))
+
     # An answer that never arrived: the error names the budget that ran out.
     stub = StubClient(scenario="truncated")
     try:
@@ -698,6 +777,121 @@ def _run_checks() -> int:
     check("reject_thinking: the re-ask carries no thinking",
           len(stub.requests) == 2 and stub.requests[1].get("thinking") is None,
           str(stub.requests[1].get("thinking")))
+
+    # A server that knows the thinking field and refuses the *value* in it: a bad number is not a missing
+    # field, so nothing is dropped, nothing is remembered, and the provider's own error travels back.
+    stub = StubClient(scenario="reject_budget_value", surface="messages")
+    try:
+        SystemOneClient(
+            stub,
+            model="stub-model",
+            method="structured",
+            reasoning=ReasoningConfig(mode="native", budget_tokens=1024),
+        ).system_one(state=state, questions={"intent": question()})
+    except ProviderError as exc:
+        check("reject_budget_value: the provider's own error travels back",
+              exc.status_code == 400 and "must be at least 1024" in str(exc), f"{exc.status_code}: {exc}")
+        check("reject_budget_value: no re-ask is spent and no limit is remembered",
+              len(stub.requests) == 1 and stub.requests[0].get("thinking") is not None,
+              f"requests={len(stub.requests)}")
+    except JevperError as exc:  # pragma: no cover - the wrong error type
+        check("reject_budget_value: the provider's own error travels back", False, repr(exc))
+    else:  # pragma: no cover
+        check("reject_budget_value: the provider's own error travels back", False, "no error")
+
+    # extra_body is merged after jevper's own parameters, so a key named there is what reaches the wire —
+    # including a capability field, which is dropped with jevper's own so the re-ask really re-asks.
+    stub = StubClient(scenario="structured", surface="messages")
+    SystemOneClient(
+        stub,
+        model="stub-model",
+        method="structured",
+        reasoning=ReasoningConfig(mode="native", budget_tokens=1024),
+    ).system_one(state=state, questions={"intent": question()})
+    check("messages: the default max_tokens grows by the thinking budget",
+          stub.requests[0].get("max_tokens") == 2048, str(stub.requests[0].get("max_tokens")))
+
+    stub = StubClient(scenario="structured", surface="messages")
+    SystemOneClient(
+        stub,
+        model="stub-model",
+        method="structured",
+        reasoning=ReasoningConfig(mode="native", budget_tokens=1024),
+        extra_body={"max_tokens": 4096},
+    ).system_one(state=state, questions={"intent": question()})
+    check("messages: a caller's max_tokens in extra_body still wins outright",
+          stub.requests[0].get("max_tokens") == 4096, str(stub.requests[0].get("max_tokens")))
+
+    stub = StubClient(scenario="reject_thinking", surface="messages")
+    response = SystemOneClient(
+        stub,
+        model="stub-model",
+        method="structured",
+        reasoning=ReasoningConfig(mode="native", budget_tokens=1024),
+        extra_body={"thinking": {"type": "enabled", "budget_tokens": 512}},
+    ).system_one(state=state, questions={"intent": question()})
+    check("reject_thinking: the caller's own copy of the field is dropped with jevper's",
+          response.debug["server_limits"]["thinking"] is False
+          and len(stub.requests) == 2 and stub.requests[1].get("thinking") is None,
+          str([request.get("thinking") for request in stub.requests]))
+
+    # A model that refuses instead of answering: the message says so, in the model's own words where the
+    # surface carries them, rather than reading as a malformed JSON object.
+    stub = StubClient(scenario="refusal", surface="chat_completions")
+    try:
+        SystemOneClient(stub, model="stub-model", method="structured").system_one(
+            state=state, questions={"intent": question()}
+        )
+    except MalformedAnswerError as exc:
+        check("refusal: the error says the model refused, in its own words",
+              "refused to answer" in str(exc) and REFUSAL in str(exc), str(exc))
+    except JevperError as exc:  # pragma: no cover - the wrong error type
+        check("refusal: the error says the model refused, in its own words", False, repr(exc))
+    else:  # pragma: no cover
+        check("refusal: the error says the model refused, in its own words", False, "no error")
+
+    stub = StubClient(scenario="refusal", surface="messages")
+    try:
+        SystemOneClient(stub, model="stub-model").system_one(state=state, questions={"intent": question()})
+    except MalformedAnswerError as exc:
+        check("refusal: the Messages stop_reason reads as a refusal too",
+              "refused to answer" in str(exc), str(exc))
+    except JevperError as exc:  # pragma: no cover - the wrong error type
+        check("refusal: the Messages stop_reason reads as a refusal too", False, repr(exc))
+    else:  # pragma: no cover
+        check("refusal: the Messages stop_reason reads as a refusal too", False, "no error")
+
+    # The same spent budget on the Messages surface, where this surface calls it "max_tokens".
+    stub = StubClient(scenario="truncated", surface="messages")
+    try:
+        SystemOneClient(stub, model="stub-model").system_one(state=state, questions={"intent": question()})
+    except MalformedAnswerError as exc:
+        check("truncated: the Messages stop_reason names the output budget too",
+              "ran out of output tokens" in str(exc) and "max_tokens" in str(exc), str(exc))
+    except JevperError as exc:  # pragma: no cover - the wrong error type
+        check("truncated: the Messages stop_reason names the output budget too", False, repr(exc))
+    else:  # pragma: no cover
+        check("truncated: the Messages stop_reason names the output budget too", False, "no error")
+
+    # With structured_outputs=False the request already carries a plain json_object, so a server that
+    # refuses any format field goes straight to "no format field" instead of spending a call re-sending
+    # the same bytes — while the default shape walks the whole ladder down to the same place.
+    stub = StubClient(scenario="reject_format")
+    response = SystemOneClient(
+        stub, model="stub-model", method="structured", structured_outputs=False
+    ).system_one(state=state, questions={"intent": question()})
+    check("structured_outputs=False: a refused format field skips the json_object rung",
+          response.debug["server_limits"]["structured"] == "none" and len(stub.requests) == 2,
+          f"limits={response.debug.get('server_limits')} requests={len(stub.requests)}")
+
+    stub = StubClient(scenario="reject_format")
+    response = SystemOneClient(stub, model="stub-model", method="structured").system_one(
+        state=state, questions={"intent": question()}
+    )
+    check("reject_format: the default shape walks every rung, and the answer still arrives",
+          response.debug["server_limits"]["structured"] == "none" and len(stub.requests) == 3
+          and response.answers["intent"].choice == "billing",
+          f"limits={response.debug.get('server_limits')} requests={len(stub.requests)}")
 
     # A label readout on this surface is refused before the request: the API has no logprob field.
     stub = StubClient(scenario="structured", surface="messages")
