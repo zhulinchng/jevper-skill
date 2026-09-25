@@ -8,7 +8,7 @@
 
 ## Does this provider do logprobs?
 
-Observed against each provider's live API, as of jevper 0.6.0 — providers move, so treat a row as a
+Observed against each provider's live API, as of jevper 0.7.0 — providers move, so treat a row as a
 starting point rather than a law, and let `auto` verify it per `(model, surface)` for you.
 
 | Provider | `logprobs` | Note |
@@ -75,7 +75,7 @@ needs raises `ClientCapabilityError` naming the surface to pass explicitly.
 
 | | Chat Completions | Responses | Messages |
 | --- | --- | --- | --- |
-| messages | `messages=[...]` | `input=[...]`, plus `store=false` | `messages=[...]` + top-level `system` |
+| messages | `messages=[...]` | `input=[{"type": "message", ...}]`, plus `store=false` | `messages=[...]` + top-level `system` |
 | logprobs | `logprobs=true`, `top_logprobs=N` | `top_logprobs=N`, `include=["message.output_text.logprobs"]` | none — the API has no such field |
 | JSON schema | `response_format={"type": "json_schema", "json_schema": {...}}` | `text={"format": {"type": "json_schema", ...}}` | `output_config={"format": {"type": "json_schema", ...}}` in the body, and the schema in the system prompt too |
 | schema fallback (`structured_outputs=False`) | `response_format={"type": "json_object"}` | `text={"format": {"type": "json_object"}}` | the prompt, always |
@@ -91,6 +91,21 @@ protocol is the exception — it has no server-side default, so jevper always se
 
 OpenRouter's Responses API is stateless — `store: true` or a `previous_response_id` is a `400` — so the
 `store=false` jevper already sends is the form it accepts, and the whole history travels in `input` each call.
+
+**The Responses route speaks two dialects.** `/v1/responses` is both OpenAI's Responses API and the
+[OpenResponses](https://www.openresponses.org) specification (current release `2026-04-24`), which LM Studio
+implements since 0.3.39 and which vLLM says its route "aligns with"; llama.cpp and SGLang serve it too, and
+ollama answers the measured shapes. jevper does not negotiate a dialect — there is no version header and no
+`Accept` switch — it sends the intersection: every input turn a typed `{"type": "message", ...}` item (OpenAI
+accepts the same, the spec's union requires the `type`) with its content a plain string. Measured across the
+five local servers, both that and `input_text` parts are accepted; the string form is what jevper sends
+because it is the one both dialects are known to read, not because any server refused the other.
+Reading back, jevper accepts either dialect's text parts (`output_text`, `text`, `input_text`), its
+reasoning parts (`summary_text`, `reasoning_text`, `text`), an own `status` per output item, a
+`phase`-labelled message (`commentary` then `final_answer`, only the last read), and logprob tokens carried
+as raw `bytes` for a byte-level tokenizer. What costs a call: an item still `in_progress` under a
+`completed` response is a `ProviderError` (not an empty answer), and a non-streaming request answered with
+an event stream is a named `ProviderError` rather than a parse crash.
 
 Where a request cannot be *relied on* to state the answer's shape, the JSON Schema also travels in the
 system prompt: always on the Messages surface, and on the OpenAI surfaces when `structured_outputs=False` or
@@ -138,6 +153,36 @@ A local server is the same client with a different `base_url`. Checked on one 12
 | vLLM | `http://127.0.0.1:8000/v1` | the `--served-model-name` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--reasoning-parser qwen3`; `top_logprobs` capped by `--max-logprobs` (20) |
 | SGLang | `http://127.0.0.1:30000/v1` | the `--served-model-name` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--reasoning-parser qwen3`; its Responses route needs `top_logprobs`, which jevper always sends |
 | LM Studio | `http://127.0.0.1:1234/v1` | the id `lms ls` prints | nothing reliably — load an instruct model | all three surfaces on one box, as on the other four; logprobs arrive on both OpenAI surfaces, but its Responses route ignores the schema, so structured answers belong on Chat Completions |
+
+**The OpenResponses route, measured.** Raw HTTP against `/v1/responses` on the 0.7.0 sweep, same card and
+models, with thinking off — the eight questions jevper's own Responses request raises:
+
+| | ollama 0.34.3 | llama.cpp | LM Studio | vLLM 0.30.1 | SGLang 0.5.20 |
+| --- | --- | --- | --- | --- | --- |
+| typed items, content a string | 200 | 200 | 200 | 200 | 200 |
+| the same with `input_text` parts | 200 | 200 | 200 | 200 | 200 |
+| `include` + `top_logprobs: 5` | `logprobs: []` | `400 top_logprobs requires logprobs to be set to true` | real logprobs on the part, **with `bytes`** | real logprobs with `bytes` | real logprobs with `bytes` |
+| strict `text.format` with a `const` | 200, ignored | 200, ignored | 200, ignored — the model invents its own shape | **enforced**: the const came back | **enforced** |
+| a nonsense `format.type` | 200 | 200 | 200 | **400** | **400** |
+| unknown model id | `404` naming it | 200 (ignored) | 200 (ignored) | `404` naming it | `404` |
+| `reasoning.encrypted_content` in `include` | 200 | 200 | 200 | 200 | 200 |
+
+Three things follow. The **portable request form works everywhere**: a typed item with string content is
+accepted by all five, and so are `input_text` parts. The **schema is enforced by vLLM and SGLang only**:
+LM Studio's Responses route accepts `text.format` with a strict `json_schema` and ignores it — the canary
+question came back as the model's own shape — which is why structured work belongs on Chat Completions
+there, while vLLM and SGLang answer it with the constant the prompt never mentioned and `400` a format type
+they do not know. And a **`404` is not the same on every surface**: ollama, vLLM and SGLang name the model
+on `/v1/responses` (so `auto` reports the model rather than moving), while llama.cpp and LM Studio answer
+`200` for an id they do not have — and SGLang's *Chat* route answers `200` too, substituting a model, while
+its Responses route `404`s. `top_logprobs: 20` — the client's default — was measured returning **twenty**
+alternatives for the answer token (ollama and SGLang, directly; the library's sweep has the other three),
+and `n: 2` is *not* portable: vLLM and SGLang return two choices, ollama and LM Studio accept the field and
+answer once, and llama.cpp refuses it when it serves one slot (`400 n must be between 1 <= value <= 1`).
+One more ollama-specific trap, measured: the thinking-off knob reaches its Chat route but **not** its
+Responses route. The same request with `max_output_tokens: 96` came back `completed` with a reasoning item
+and an **empty** message, and 512 tokens left room for the answer — so on that route a small budget looks
+like a server that has nothing to say, and raising it is the fix rather than the thinking toggle.
 
 `api="auto"` works against all five: it prefers Responses, and when that route is missing or answers
 without a distribution it re-asks on Chat Completions and remembers the verdict. `api="chat_completions"`
@@ -225,11 +270,11 @@ Four protocol facts shape what the client does on this surface:
 - **A schema field now exists** — Anthropic's own `output_config.format`, sent in the request body (the
   oldest SDK jevper supports has no parameter for it) with each unsupported bound moved into the field's
   description, and the JSON Schema still in the system prompt. Whether it does anything is the server's
-  business, and four of the five local ones say nothing either way: measured on 0.6.0, only vLLM *enforces*
-  it (a schema whose only legal answer names a constant the prompt never mentions comes back with that
-  constant, and an unknown `format.type` is a `400` naming `body.output_config.format.type`), while
-  llama.cpp and LM Studio accept the field and ignore it. ollama and SGLang accept it too, but with a
-  thinking model nothing comes back on that route to enforce it — a 1024-token request returns empty with
+  business, and four of the five local ones say nothing either way: measured again on 0.7.0, only vLLM
+  *enforces* it (a schema whose only legal answer names a constant the prompt never mentions comes back
+  with that constant, and an unknown `format.type` is a `400` naming `body.output_config.format.type`),
+  while llama.cpp and LM Studio accept the field and ignore it. ollama and SGLang accept it too, but with
+  a thinking model nothing comes back on that route to enforce it — a 1024-token request returns empty with
   `stop_reason: "max_tokens"` with the field, with a nonsense one, and with no field at all.
 - **`max_tokens` is required** by vLLM's and SGLang's implementations and has no default on any of them, so
   jevper always sends one: `1024`, or `1024` plus the caller's `ReasoningConfig(budget_tokens=n)`, because
@@ -259,8 +304,8 @@ reasoning only, or `IncompleteAnswerError` when the trace spent the output budge
 (`extra_body={"chat_template_kwargs": {"enable_thinking": False}}`, or
 `{"reasoning_effort": "none"}` on ollama) — that body reaches this surface whatever else is on the request,
 so the knob is not silently dropped, and with it vLLM's route answers. It is not enough everywhere: measured
-on 0.6.0, ollama and SGLang still spend a 1024-token budget on a thinking model's trace and return no text,
-so on those two use the OpenAI surfaces or `extra_body={"max_tokens": 2048}`. SGLang needs one more
+again on 0.7.0, ollama and SGLang still spend a 1024-token budget on a thinking model's trace and return no
+text, so on those two use the OpenAI surfaces or `extra_body={"max_tokens": 2048}`. SGLang needs one more
 server-side decision: with `--reasoning-parser qwen3` and a
 *non-thinking* model, whose template has no `enable_thinking` to set, the parser never sees the closing
 marker it waits for and classifies the whole generation as reasoning — dropping `--reasoning-parser` fixes

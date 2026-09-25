@@ -43,6 +43,18 @@ Scenarios:
                          budget, but the remedy is the opposite one: shorten the state, not the cap
     failed_response      a Responses call the provider reports as ``failed`` rather than completing, which
                          is its failure rather than a malformed answer
+    embedded_error        a provider error carried inside a 200 body — OpenRouter's way of reporting an
+                         overloaded upstream — which outranks the answer sitting beside it
+    content_filter        a safety filter that withheld the answer: a refusal in everything but the word
+    item_in_progress      a Responses answer item still in progress under a response that claims it is
+                         complete
+    positive_logprob      a provider reporting "logprobs" that no log probability can be
+    no_rival_alternative  two reported alternatives, neither of which is a distribution over the options
+    contradicts_text      a sampled label that disagrees with the answer text beside it
+    two_objects           a structured answer carrying more than one JSON object
+    transient             a provider that fails the first attempt with a retryable status
+    reject_reasoning_include  a server that refuses only ``reasoning.encrypted_content``, so the
+                         logprob carrier in the same include list survives
     reject_output_config a server whose Messages protocol has no ``output_config`` field — Anthropic's own
                          schema-constrained-output field, which most local servers do not implement
     reasoning            a chat-surface two-step sequence: analysis text, then the answer
@@ -53,9 +65,11 @@ Knobs: ``surface`` (``chat_completions``, ``responses``, ``messages`` or ``both`
 endpoints this client exposes, as ``openai.OpenAI`` exposes the first two and ``anthropic.Anthropic`` the
 third), ``winner`` (index into the label alphabet of the option the stub prefers), ``alternatives`` (labels
 reported alongside the answer; 1 means "no distribution"), ``cached_tokens`` (what the server reports as
-read from its prompt cache; ``None`` models a server that says nothing about it) and ``self_reported`` (the
+read from its prompt cache; ``None`` models a server that says nothing about it), ``self_reported`` (the
 probabilities a model states itself, replacing the stub's own distribution — a model whose JSON does not add
-up to 1, which is what ``normalize_probabilities=False`` hands back verbatim). ``requests`` records what
+up to 1, which is what ``normalize_probabilities=False`` hands back verbatim), ``reject_status`` and
+``retry_headers`` (the status and response headers on the ``transient`` scenario's first refusal, the way
+the SDKs surface them, so the retry rules can be exercised without a clock). ``requests`` records what
 each call put on the wire — the kwargs with ``extra_body`` merged in, as the SDK merges it — and
 ``surfaces`` the endpoint each one went to, in the same order.
 
@@ -94,8 +108,17 @@ SCENARIOS = (
     "truncated",
     "truncated_context",
     "failed_response",
+    "embedded_error",
+    "content_filter",
+    "item_in_progress",
     "refusal",
     "reject_output_config",
+    "positive_logprob",
+    "no_rival_alternative",
+    "contradicts_text",
+    "two_objects",
+    "transient",
+    "reject_reasoning_include",
     "reasoning",
     "reasoning_only",
 )
@@ -114,13 +137,22 @@ CACHED_TOKENS = 1010  # llama.cpp's reuse for a state-varied second call on that
 
 
 class Rejection(Exception):
-    """A refusal jevper classifies instead of retrying: a capability 400, or a 404 for a whole route."""
+    """A refusal jevper classifies instead of retrying: a capability 400, or a 404 for a whole route.
+
+    ``headers`` and ``status_code`` are the attributes the SDKs put on their own status errors, so the
+    retry rules — which read the status, then ``x-should-retry`` — can be exercised here offline.
+    """
 
     def __init__(
-        self, message: str = "logprobs are not supported with reasoning models.", status_code: int = 400
+        self,
+        message: str = "logprobs are not supported with reasoning models.",
+        status_code: int = 400,
+        *,
+        headers: dict[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.headers = dict(headers or {})
 
 
 def _wants_logprobs(kwargs: dict[str, Any]) -> bool:
@@ -343,6 +375,8 @@ class StubClient:
         winner: int = 0,
         alternatives: int | None = None,
         cached_tokens: int | None = CACHED_TOKENS,
+        reject_status: int = 503,
+        retry_headers: dict[str, str] | None = None,
         self_reported: dict[str, float] | None = None,
     ) -> None:
         if scenario not in SCENARIOS:
@@ -355,6 +389,8 @@ class StubClient:
         self.alternatives = alternatives
         self.cached_tokens = cached_tokens
         self.self_reported = self_reported
+        self.reject_status = reject_status
+        self.retry_headers = retry_headers
         self.requests: list[dict[str, Any]] = []
         self.surfaces: list[str] = []
         if surface in ("chat_completions", "both"):
@@ -398,6 +434,11 @@ class StubClient:
             # nowhere to move, so this is the 404 jevper must keep reporting, call after call.
             raise Rejection("Not Found", status_code=404)
 
+        if self.scenario == "transient" and len(self.requests) == 1:
+            # The first attempt fails in a way the retry rules decide about; the second answers. The
+            # status and headers are the ones an SDK would surface on its own status error.
+            raise Rejection("upstream temporarily overloaded", self.reject_status, headers=self.retry_headers)
+
         schema = _requested_schema(kwargs) or _prompt_schema(kwargs)
         if self.scenario == "reject_schema" and _requested_schema(kwargs) is not None:
             # The strict schema is refused; ``json_object`` is not, so the ladder has all three rungs.
@@ -421,6 +462,18 @@ class StubClient:
             # OpenRouter's Responses API refuses the logprob includable outright, without ever writing
             # the word "logprob"; the same server carries the distribution on Chat Completions.
             raise Rejection('Invalid option: expected one of "chat", "message". at path: ["include", 0]')
+        if (
+            self.scenario == "reject_reasoning_include"
+            and surface == "responses"
+            and "reasoning.encrypted_content" in (kwargs.get("include") or ())
+        ):
+            # A two-entry include list where the refusal names entry 1: the logprob carrier is fine and
+            # only the reasoning includable goes, which is the case a "drop the whole list" reading
+            # would get wrong — and a common one, because OpenAI's own message names the survivor.
+            raise Rejection(
+                "Invalid value: 'reasoning.encrypted_content' at 'include[1]'. "
+                "Supported values are: 'message.output_text.logprobs'."
+            )
         if self.scenario == "reject_logprobs" and _wants_logprobs(kwargs):
             raise Rejection()
 
@@ -449,8 +502,33 @@ class StubClient:
             # before any readout, so a failed body that still carried text would not be read as an answer.
             payload = _responses_body(kwargs, text="", cached=self.cached_tokens)
             payload["status"] = "failed"
-            payload["error"] = {"message": "the model worker stopped unexpectedly"}
+            payload.pop("output_text", None)
             return payload
+
+        if self.scenario == "embedded_error":
+            # A 200 whose body carries the provider's own failure (OpenRouter's overload shape). The
+            # code arrives as a digit string about as often as a number, and both are read; the answer
+            # that may sit beside the error loses to it.
+            payload = _chat_body(kwargs, text="A", cached=self.cached_tokens)
+            payload["error"] = {
+                "message": "Upstream error from Nvidia: Service temporarily overloaded",
+                "code": str(self.reject_status) if self.reject_status != 503 else "503",
+            }
+            return payload
+
+        if self.scenario == "item_in_progress" and surface == "responses":
+            # OpenResponses gives every output item its own lifecycle: a response can claim it is
+            # complete while the message inside it is still being written.
+            payload = _responses_body(kwargs, text='{"probabilities": {"billing": 0.', cached=self.cached_tokens)
+            payload["output"][0]["status"] = "in_progress"
+            return payload
+
+        if self.scenario == "content_filter":
+            # A safety filter withheld the answer. That is a refusal, not a spent budget: a second
+            # attempt is filtered the same way, so no corrective retry is spent on it.
+            if surface == "chat_completions":
+                return _chat_body(kwargs, text="", stop="content_filter", cached=self.cached_tokens)
+            return _responses_body(kwargs, text="", stop="content_filter", cached=self.cached_tokens)
 
         if self.scenario == "refusal":
             # A refusal instead of an answer. Only the Chat surface carries the model's own words.
@@ -472,16 +550,51 @@ class StubClient:
                 return body(
                     kwargs, entries=self._entries(kwargs, alternatives=1), cached=self.cached_tokens
                 )
-            if self.scenario in ("logprobs", "reasoning", "no_responses_route", "reject_include"):
+            if self.scenario == "positive_logprob":
+                # A number that no log probability can be: jevper refuses the reading rather than
+                # exponentiating it into a confident answer.
+                entries = self._entries(kwargs)
+                entries[0]["logprob"] = 0.5
+                return body(kwargs, entries=entries, cached=self.cached_tokens)
+            if self.scenario == "no_rival_alternative":
+                # Reported alternatives, none of which is an option carrying a usable logprob: not a
+                # distribution over the choices, and never one option at probability 1.
+                entries = self._entries(kwargs)
+                entries[0]["top_logprobs"] = [
+                    *entries[0]["top_logprobs"][:1],
+                    {"token": "Alpha", "logprob": None},
+                    {"token": "Billing", "logprob": None},
+                ]
+                return body(kwargs, entries=entries, cached=self.cached_tokens)
+            if self.scenario == "contradicts_text":
+                # The sampled token says one label, the text beside it says another: neither view can
+                # be trusted, so the answer is refused instead of read from either.
+                entries = self._entries(kwargs)
+                return body(kwargs, text="B. billing", entries=entries, cached=self.cached_tokens)
+            if self.scenario in ("logprobs", "reasoning", "no_responses_route", "reject_include",
+                                 "reject_reasoning_include"):
                 return body(kwargs, entries=self._entries(kwargs), cached=self.cached_tokens)
             return body(kwargs, entries=[], cached=self.cached_tokens)  # no logprobs to give back
 
         answer = _schema_answer(schema, self.winner) if schema is not None else None
+        if self.scenario == "two_objects":
+            # Two decodable objects in one answer: which one is the answer would be a guess, so the
+            # answer is refused. A stray brace in prose is not the same thing, and is tolerated.
+            once = json.dumps(answer if answer is not None else {"probabilities": _distribution(["a", "b"], self.winner)})
+            return body(kwargs, text=f"{once}\n{once}", cached=self.cached_tokens)
         if answer is not None:
             if self.self_reported is not None and "probabilities" in answer:
                 answer = {**answer, "probabilities": dict(self.self_reported)}
             return body(kwargs, body=answer, cached=self.cached_tokens)
         return body(kwargs, text="A", cached=self.cached_tokens)  # a request jevper reads no answer out of
+
+    def _probe_schema(self) -> dict[str, Any] | None:
+        """The schema jevper last sent, read back off the recorded request it answered with."""
+        for request in reversed(self.requests):
+            schema = _requested_schema(request) or _prompt_schema(request)
+            if schema is not None:
+                return schema
+        return None
 
 
 # -- self-test ---------------------------------------------------------------------------------------
@@ -495,6 +608,7 @@ def _run_checks() -> int:
         LabelReadoutError,
         MalformedAnswerError,
         ModelRefusalError,
+        Noul,
         ProviderError,
         ReasoningConfig,
         Score,
@@ -943,7 +1057,9 @@ def _run_checks() -> int:
     except IncompleteAnswerError as exc:
         text = str(exc)
         check("truncated: a cut-off answer is IncompleteAnswerError naming the budget",
-              "ran out of output tokens" in text and "max_tokens" in text, text)
+              "ran out of output tokens" in text and "max_output_tokens" in text, text)
+        check("truncated: the remedy names the Responses surface's own knob, not Chat's",
+              "extra_body={'max_output_tokens': 2048}" in text, text)
         check("truncated: no corrective retry is spent on a cut-off answer", len(stub.requests) == 1,
               str(len(stub.requests)))
     except JevperError as exc:  # pragma: no cover - the wrong error type
@@ -961,7 +1077,7 @@ def _run_checks() -> int:
     except IncompleteAnswerError as exc:
         check("truncated: the Chat finish_reason names the same spent budget",
               "ran out of output tokens" in str(exc) and "'length'" in str(exc)
-              and len(stub.requests) == 1, str(exc))
+              and "extra_body={'max_tokens': 2048}" in str(exc) and len(stub.requests) == 1, str(exc))
     except JevperError as exc:  # pragma: no cover - the wrong error type
         check("truncated: the Chat finish_reason names the same spent budget", False, repr(exc))
     else:  # pragma: no cover
@@ -1238,7 +1354,7 @@ def _run_checks() -> int:
         )
     except ProviderError as exc:
         check("failed_response: a failed Responses status is a provider failure, not a bad answer",
-              "status='failed'" in str(exc) and "stopped unexpectedly" in str(exc), str(exc))
+              "status='failed'" in str(exc) and "before the answer was complete" in str(exc), str(exc))
         check("failed_response: it spends no corrective retry", len(stub.requests) == 1,
               str(len(stub.requests)))
     except JevperError as exc:  # pragma: no cover - the wrong error type
@@ -1297,6 +1413,301 @@ def _run_checks() -> int:
         check("reasoning_only: the error says the response carried reasoning only", False, repr(exc))
     else:  # pragma: no cover
         check("reasoning_only: the error says the response carried reasoning only", False, "no error")
+
+    # --- jevper 0.7.0: the shapes a provider can send that earlier releases read as an answer --------
+
+    # A provider error carried in the body of a 200 (OpenRouter's overload shape). The answer that
+    # may sit beside it loses: a body that says both is a body nobody can vouch for. The code arrives
+    # as a digit string as often as a number, and a body-carried status is not a missing route.
+    stub = StubClient(scenario="embedded_error", surface="chat_completions", reject_status=400)
+    try:
+        SystemOneClient(stub, model="stub-model", method="structured").system_one(
+            state=state, questions={"intent": question()}
+        )
+    except ProviderError as exc:
+        check("embedded_error: an error in a 200 outranks the answer beside it",
+              "provider reported an error" in str(exc) and exc.embedded is True, f"{exc!r}")
+        check("embedded_error: the status is read from a code sent as a digit string",
+              exc.status_code == 400, str(exc.status_code))
+        check("embedded_error: a body-carried status is not retried, and spends no corrective retry",
+              len(stub.requests) == 1, str(len(stub.requests)))
+    except JevperError as exc:  # pragma: no cover - the wrong error type
+        check("embedded_error: an error in a 200 outranks the answer beside it", False, repr(exc))
+    else:  # pragma: no cover
+        check("embedded_error: an error in a 200 outranks the answer beside it", False, "no error")
+
+    # The same shape with a transient code is still transient: the status travels with the error, so
+    # an upstream outage stays retryable even though the HTTP line said 200.
+    stub = StubClient(scenario="embedded_error", surface="chat_completions", reject_status=503)
+    try:
+        SystemOneClient(stub, model="stub-model", method="structured", n_retry_malformed=0).system_one(
+            state=state, questions={"intent": question()}
+        )
+    except ProviderError as exc:
+        check("embedded_error: a 503 in the body is still retried, and then reported",
+              exc.embedded is True and exc.status_code == 503 and len(stub.requests) == 3,
+              f"embedded={exc.embedded} status={exc.status_code} requests={len(stub.requests)}")
+    except JevperError as exc:  # pragma: no cover - the wrong error type
+        check("embedded_error: a 503 in the body is still retried, and then reported", False, repr(exc))
+    else:  # pragma: no cover
+        check("embedded_error: a 503 in the body is still retried, and then reported", False, "no error")
+
+    # A safety filter withheld the answer. That is a refusal, not a spent budget: the same request is
+    # filtered the same way, so a corrective retry would be a call spent to be refused again.
+    for surface, stop in (("chat_completions", "content_filter"), ("responses", "content_filter")):
+        stub = StubClient(scenario="content_filter", surface=surface)
+        try:
+            SystemOneClient(stub, model="stub-model", method="structured", api=surface).system_one(
+                state=state, questions={"intent": question()}
+            )
+        except ModelRefusalError as exc:
+            check(f"content_filter: a filtered {surface} answer is a refusal, not a spent budget",
+                  "filtered the content for safety" in str(exc) and stop in str(exc), str(exc))
+            check(f"content_filter: the {surface} filter spends no corrective retry",
+                  len(stub.requests) == 1, str(len(stub.requests)))
+        except JevperError as exc:  # pragma: no cover - the wrong error type
+            check(f"content_filter: a filtered {surface} answer is a refusal, not a spent budget",
+                  False, repr(exc))
+        else:  # pragma: no cover
+            check(f"content_filter: a filtered {surface} answer is a refusal, not a spent budget",
+                  False, "no error")
+
+    # OpenResponses gives every output item its own lifecycle: a response can claim completion while
+    # the message inside it is still being written, which is a provider failure, not an empty answer.
+    stub = StubClient(scenario="item_in_progress", surface="responses")
+    try:
+        SystemOneClient(stub, model="stub-model", method="structured", api="responses").system_one(
+            state=state, questions={"intent": question()}
+        )
+    except ProviderError as exc:
+        check("item_in_progress: a response whose message is still in progress is a provider failure",
+              "in_progress" in str(exc) and not isinstance(exc, IncompleteAnswerError), str(exc))
+        check("item_in_progress: it spends no corrective retry", len(stub.requests) == 1,
+              str(len(stub.requests)))
+    except JevperError as exc:  # pragma: no cover - the wrong error type
+        check("item_in_progress: a response whose message is still in progress is a provider failure",
+              False, repr(exc))
+    else:  # pragma: no cover
+        check("item_in_progress: a response whose message is still in progress is a provider failure",
+              False, "no error")
+
+    # A "logprob" no log probability can be: refused, not exponentiated into a confident answer.
+    stub = StubClient(scenario="positive_logprob", surface="chat_completions")
+    try:
+        SystemOneClient(stub, model="stub-model", method="logprobs").system_one(
+            state=state, questions={"intent": question()}
+        )
+    except LabelReadoutError as exc:
+        check("positive_logprob: a positive value is refused as something that is not a logprob",
+              "is positive" in str(exc), str(exc))
+    except JevperError as exc:  # pragma: no cover - the wrong error type
+        check("positive_logprob: a positive value is refused as something that is not a logprob",
+              False, repr(exc))
+    else:  # pragma: no cover
+        check("positive_logprob: a positive value is refused as something that is not a logprob",
+              False, "no error")
+
+    # Reported alternatives that are not a distribution over the options. `auto` reads this as no
+    # distribution and answers in JSON; it must not report the sampled label at probability 1.
+    stub = StubClient(scenario="no_rival_alternative", surface="chat_completions")
+    response = SystemOneClient(stub, model="stub-model").system_one(
+        state=state, questions={"intent": question()}
+    )
+    check("no_rival_alternative: alternatives that are not a distribution fall back to structured",
+          response.debug["methods"]["intent"] == "structured"
+          and response.answers["intent"].choice == "billing",
+          str(response.debug["methods"]))
+    check("no_rival_alternative: the fallback says what was wrong with the distribution",
+          any("none of which" in reason for reason in response.debug["retry_reasons"]),
+          str(response.debug["retry_reasons"])[:200])
+
+    # The sampled token and the answer text disagree: neither view can be trusted, so the answer is
+    # refused rather than read from either. It is an ordinary readout error, so a retry is spent.
+    stub = StubClient(scenario="contradicts_text", surface="chat_completions")
+    try:
+        SystemOneClient(stub, model="stub-model", method="logprobs", n_retry_malformed=0).system_one(
+            state=state, questions={"intent": question()}
+        )
+    except LabelReadoutError as exc:
+        check("contradicts_text: a sampled token that disagrees with the text is refused",
+              "contradicts the answer text" in str(exc), str(exc))
+    except JevperError as exc:  # pragma: no cover - the wrong error type
+        check("contradicts_text: a sampled token that disagrees with the text is refused", False, repr(exc))
+    else:  # pragma: no cover
+        check("contradicts_text: a sampled token that disagrees with the text is refused", False, "no error")
+
+    # Two decodable objects in one answer: which one is the answer would be a guess.
+    stub = StubClient(scenario="two_objects", surface="chat_completions")
+    try:
+        SystemOneClient(stub, model="stub-model", method="structured", n_retry_malformed=0).system_one(
+            state=state, questions={"intent": question()}
+        )
+    except MalformedAnswerError as exc:
+        check("two_objects: more than one JSON object is malformed", "more than one JSON object" in str(exc),
+              str(exc))
+    except JevperError as exc:  # pragma: no cover - the wrong error type
+        check("two_objects: more than one JSON object is malformed", False, repr(exc))
+    else:  # pragma: no cover
+        check("two_objects: more than one JSON object is malformed", False, "no error")
+
+    # Retries: a transient status is repeated, a capability 400 is not, and x-should-retry has the
+    # last word in both directions. The second attempt answers, so one retry is all it takes.
+    for status, retried in ((503, True), (429, True), (409, True), (500, True), (400, False), (422, False)):
+        stub = StubClient(scenario="transient", surface="chat_completions", reject_status=status)
+        try:
+            response = SystemOneClient(
+                stub, model="stub-model", method="structured", n_retry_malformed=0
+            ).system_one(state=state, questions={"intent": question()})
+            arrived = response.answers["intent"].choice == "billing"
+        except ProviderError:
+            arrived = False
+        check(f"retry: HTTP {status} is {'retried' if retried else 'not retried'}",
+              (len(stub.requests) == 2) == retried and (arrived == retried),
+              f"requests={len(stub.requests)} arrived={arrived}")
+
+    stub = StubClient(
+        scenario="transient", surface="chat_completions", reject_status=503,
+        retry_headers={"x-should-retry": "false"},
+    )
+    try:
+        SystemOneClient(stub, model="stub-model", method="structured").system_one(
+            state=state, questions={"intent": question()}
+        )
+    except ProviderError:
+        suppressed = len(stub.requests) == 1
+    else:  # pragma: no cover
+        suppressed = False
+    check("retry: x-should-retry: false suppresses a nominally transient status", suppressed,
+          str(len(stub.requests)))
+
+    stub = StubClient(
+        scenario="transient", surface="chat_completions", reject_status=400,
+        retry_headers={"X-Should-Retry": "TRUE"},
+    )
+    response = SystemOneClient(stub, model="stub-model", method="structured").system_one(
+        state=state, questions={"intent": question()}
+    )
+    check("retry: x-should-retry: true retries a 400, whatever the header's spelling",
+          len(stub.requests) == 2 and response.usage.n_retries == 1,
+          f"requests={len(stub.requests)} n_retries={response.usage.n_retries}")
+
+    # The portable Responses request form: every input turn is a typed item, because the
+    # OpenResponses union discriminates on ``type`` and OpenAI accepts the same thing.
+    stub = StubClient(scenario="logprobs", surface="responses")
+    SystemOneClient(stub, model="stub-model", method="logprobs", api="responses").system_one(
+        state=state, questions={"intent": question()}
+    )
+    turns = stub.requests[0].get("input") or []
+    check("responses: every input turn carries the item type the OpenResponses union requires",
+          turns and all(turn.get("type") == "message" for turn in turns)
+          and {turn.get("role") for turn in turns} == {"system", "user"},
+          str([{k: v for k, v in turn.items() if k != "content"} for turn in turns]))
+
+    # A two-entry include list where the refusal names the second entry: the logprob carrier survives,
+    # which is what a "the server said no to include" reading would get wrong.
+    stub = StubClient(scenario="reject_reasoning_include", surface="responses")
+    response = SystemOneClient(
+        stub, model="stub-model", method="logprobs", api="responses",
+        reasoning=ReasoningConfig(mode="native"),
+    ).system_one(state=state, questions={"intent": question()})
+    check("reject_reasoning_include: only the refused includable is dropped",
+          len(stub.requests) == 2
+          and stub.requests[1].get("include") == ["message.output_text.logprobs"]
+          and response.debug["server_limits"]["include"] is False
+          and response.answers["intent"].choice == "billing",
+          f"include={stub.requests[-1].get('include')} limits={response.debug.get('server_limits')}")
+
+    # Unpaired surrogates cannot be serialized: refused here, where the field is named, rather than
+    # failing later inside the SDK or the prompt-cache hash.
+    stub = StubClient()
+    try:
+        SystemOneClient(stub, model="stub-model").system_one(
+            state="a lone surrogate: \ud800", questions={"intent": question()}
+        )
+    except JevperError as exc:
+        check("validation: an unencodable state is refused before any request",
+              "UTF-8" in str(exc) and not stub.requests, str(exc))
+    else:  # pragma: no cover
+        check("validation: an unencodable state is refused before any request", False, "no error")
+
+    try:
+        Choice(instructions="\ud800broken", criteria={"a": "one"})
+    except JevperError as exc:
+        check("validation: an unencodable question is refused as a question error",
+              "UTF-8" in str(exc), str(exc))
+    else:  # pragma: no cover
+        check("validation: an unencodable question is refused as a question error", False, "no error")
+
+    # extra_body owns the wire after the typed parameters, so the two fields that would fight it are
+    # refused here instead of silently sending a request the caller did not ask for.
+    for field in ({"model": "other"}, {"stream": True}):
+        stub = StubClient()
+        try:
+            SystemOneClient(stub, model="stub-model", extra_body=field).system_one(
+                state=state, questions={"intent": question()}
+            )
+        except JevperError as exc:
+            check(f"validation: extra_body cannot carry {next(iter(field))}",
+                  next(iter(field)) in str(exc) and not stub.requests, str(exc))
+        else:  # pragma: no cover
+            check(f"validation: extra_body cannot carry {next(iter(field))}", False, "no error")
+
+    # A caller's logprob switch: false turns the request's logprob fields off on both surfaces, and
+    # a caller's own top_logprobs replaces jevper's rather than travelling beside it. With the fields
+    # off there is nothing for a label readout to read, so that call cannot answer — the request is the
+    # thing under test here, and a pinned method has nowhere to fall back to.
+    stub = StubClient(scenario="structured", surface="responses")
+    with contextlib.suppress(JevperError):
+        SystemOneClient(stub, model="stub-model", method="logprobs", api="responses",
+                        extra_body={"logprobs": False}).system_one(
+            state=state, questions={"intent": question()}
+        )
+    check("extra_body: logprobs=False turns off both Responses logprob fields",
+          stub.requests[0].get("logprobs") is False and stub.requests[0].get("top_logprobs") is None
+          and not stub.requests[0].get("include"),
+          str({key: stub.requests[0].get(key) for key in ("logprobs", "top_logprobs", "include")}))
+
+    stub = StubClient(scenario="logprobs", surface="responses")
+    SystemOneClient(stub, model="stub-model", method="logprobs", api="responses",
+                    extra_body={"top_logprobs": 3}).system_one(
+        state=state, questions={"intent": question()}
+    )
+    check("extra_body: a caller's top_logprobs replaces jevper's, not beside it",
+          stub.requests[0].get("top_logprobs") == 3, str(stub.requests[0].get("top_logprobs")))
+
+    # The OpenAI strict schema now carries the bounds it can express, which is also the thing to
+    # check when a server enforces a schema and one probability comes back outside the range.
+    stub = StubClient(scenario="structured", surface="chat_completions")
+    SystemOneClient(stub, model="stub-model", method="structured").system_one(
+        state=state, questions={"intent": question()}
+    )
+    sent = _requested_schema(stub.requests[0]) or {}
+    leaves = ((((sent.get("properties") or {}).get("probabilities") or {}).get("properties")) or {})
+    check("schema: the OpenAI request carries the probability bounds it can express",
+          leaves and all(option.get("minimum") == 0 for option in leaves.values()),
+          str({key: option.get("minimum") for key, option in leaves.items()}))
+
+    stub = StubClient(scenario="structured", surface="chat_completions")
+    SystemOneClient(stub, model="stub-model", method="structured").system_one(
+        state=state, questions={"q": Noul(instructions="Is this about money?")}
+    )
+    sent = _requested_schema(stub.requests[0]) or {}
+    noul = ((sent.get("properties") or {}).get("noul") or {})
+    check("schema: a Noul answer is bounded at both ends on the wire",
+          noul.get("minimum") == 0 and noul.get("maximum") == 1, str(noul))
+
+    # Questions answered on more than one surface report which, per question and per surface: the
+    # scalar keys are the final shared-context views, which a concurrent call need not agree with.
+    stub = StubClient(scenario="reject_logprobs")
+    response = SystemOneClient(stub, model="stub-model").system_one(
+        state=state, questions={"intent": question()}
+    )
+    check("debug: a call that used two surfaces reports them per question",
+          response.debug.get("apis") == {"intent": "chat_completions"}
+          and response.debug["api"] == "chat_completions", str(response.debug.get("apis")))
+    check("debug: every attempted surface reports its own limits",
+          sorted(response.debug.get("server_limits_by_api") or {}) == ["chat_completions", "responses"],
+          str(sorted(response.debug.get("server_limits_by_api") or {})))
 
     # The live probe's own reporting, exercised offline: what a model advertises, and how a failure reads.
     advertised = _capabilities({"reasoning", "max_tokens", "structured_outputs", "logprobs"})

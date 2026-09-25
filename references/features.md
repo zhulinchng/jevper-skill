@@ -73,11 +73,14 @@ Three levels, first non-empty wins, no merging:
 
 A bare sequence applies to every question in the call; a mapping is keyed by question id. Every question's
 examples are resolved and validated before the first request — a call that is locally invalid spends
-nothing, rather than failing inside one worker after the questions ahead of it have already paid. An answer
-that matches no option raises `InvalidQuestionError`. `probabilities` is only read by
-`structured` and defaults to one-hot over `answer` — a one-hot example teaches the model that answers are
-certain, so pass explicit numbers when the demonstration should teach calibration. Wrong key sets or
-negative values are refused (`InvalidQuestionError` naming the example index).
+nothing, rather than failing inside one worker after the questions ahead of it have already paid. The
+container must be a sequence of `Example` objects, and anything else is `InvalidQuestionError` naming the
+index rather than an `AttributeError` later. An answer that matches no option raises `InvalidQuestionError`,
+and a `Noul` example's `probabilities` must key each answer one way only (`True`/`False`, not
+`{True: 0.2, "true": 0.8}`, which is two spellings of one answer after JSON round-trips). `probabilities` is
+only read by `structured` and defaults to one-hot over `answer` — a one-hot example teaches the model that
+answers are certain, so pass explicit numbers when the demonstration should teach calibration. Wrong key
+sets or negative values are refused (`InvalidQuestionError` naming the example index).
 
 ## Async
 
@@ -92,7 +95,10 @@ async with AsyncSystemOneClient(AsyncOpenAI(), model="gpt-4o") as client:
 ```
 
 `aclose()` is a no-op — the async client holds no resources. Neither client ever closes the client you
-passed in; `SystemOneClient.close()` only shuts down its own thread pool.
+passed in; `SystemOneClient.close()` only shuts down its own thread pool. The facades check each other
+before any request: a blocking `SystemOneClient` handed an async SDK client (or the reverse) raises
+`ClientCapabilityError` naming the facade to use, so an `AsyncOpenAI` never sits unawaited and a thread pool
+never blocks on a coroutine.
 
 ## Surfaces
 
@@ -103,7 +109,7 @@ surface is `messages`. A client missing the attribute the chosen surface needs r
 
 | | Chat Completions | Responses | Messages |
 | --- | --- | --- | --- |
-| input | `messages=[...]` | `input=[...]`, `store=false` | `messages=[...]` + top-level `system` |
+| input | `messages=[...]` | `input=[{"type": "message", ...}]`, `store=false` | `messages=[...]` + top-level `system` |
 | logprobs | `logprobs=true`, `top_logprobs=N` | `top_logprobs=N`, `include=["message.output_text.logprobs"]` | none — the API has no such field |
 | JSON schema | `response_format={"type": "json_schema", ...}` | `text={"format": {"type": "json_schema", ...}}` | `output_config={"format": {"type": "json_schema", ...}}`, sent in the body; the schema also stays in the system prompt |
 | grammar | `extra_body={"grammar": "..."}` | not available | not available |
@@ -119,6 +125,15 @@ jevper's own when a server has refused it. That is also how `output_config` is s
 rather than as a typed keyword, so the oldest `anthropic` SDK jevper supports (`>=0.49`, which has no such
 parameter and would raise `TypeError` before sending anything) can carry it.
 
+The Responses request is the portable form of two specifications at one path — OpenAI's Responses API and
+[OpenResponses](https://www.openresponses.org) — so each input turn is a typed item and its content a plain
+string, which both accept (see [providers.md](providers.md#surfaces) for what each server does with that).
+The response is read as either dialect: text parts named `output_text`/`text`/`input_text`, reasoning under
+`summary_text`/`reasoning_text`/`text`, an item `status` of its own, `phase`-labelled messages where only
+`final_answer` is read, and logprob tokens whose `bytes` carry the exact text for a byte-level tokenizer.
+Two shapes are failures rather than answers: an output item still `in_progress` under a `completed` response,
+and an event stream sent in answer to a non-streaming request.
+
 The schema travels in the prompt wherever the request cannot be relied on to state it: always on the Messages
 surface, and on the OpenAI surfaces when `structured_outputs=False` or the server refused the strict schema.
 On the Messages surface the prompt keeps it even when the field was sent, because a server can accept
@@ -127,19 +142,23 @@ leading system message, so the question block keeps its place — and where the 
 shape, the answer's shape is only as good as the model's instruction-following.
 
 Anthropic's structured outputs implement a documented subset of JSON Schema, and an unsupported keyword is a
-`400` rather than a warning. jevper's own schemas bound every probability at `minimum: 0`, so the wire
-schema has each such bound moved into the description of the field it bounded (`Must be at least 0.`) while
-the prompt keeps the full schema, where text can say what a constraint says.
+`400` rather than a warning. The OpenAI surfaces send the bounds they *can* express — every probability at
+`minimum: 0`, a `Noul` at `maximum: 1` — and Anthropic's gets each such keyword moved into the description of
+the field it bounded (`Must be at least 0.`) while the prompt keeps the full schema, where text can say what a
+constraint says. Sum-to-one stays client-side: JSON Schema cannot express it.
 
 `auto` also falls back between the surfaces, and both verdicts are remembered for the client's life:
 
 - A **404 is a missing route** unless it quotes the model id *and* says the model does not exist, which is
   the model rather than the route — a message that merely repeats the model name is not enough, and `ollama`
-  and `vLLM` answer a bad model id that way. The call is then re-asked on the other surface. An explicit
-  `api="responses"` never falls back. The remembered verdict only ever *skips* a route, and only where the
-  client can speak the other one: a client whose only surface is `messages` stays on it, pays the 404 again,
-  and reports it as a `ProviderError` with `status_code=404` on every call — the same error the call that
-  learned the verdict raised.
+  and `vLLM` answer a bad model id that way. A 404 that arrives *inside* a `200` body never counts: that is
+  `ProviderError.embedded`, a failure the provider put in the body, and only the status line can say a route
+  is missing. The call is then re-asked on another surface, walking all three in order (Responses, Chat
+  Completions, Messages) and skipping the ones already known to be missing. An explicit `api="responses"`
+  never falls back, and a pinned `method="logprobs"` never moves to Messages, which has no logprobs to carry.
+  The remembered verdict only ever *skips* a route, and only where the client can speak another: a client
+  whose only surface is `messages` stays on it, pays the 404 again, and reports it as a `ProviderError` with
+  `status_code=404` on every call — the same error the call that learned the verdict raised.
 - A **surface that answers without a distribution** falls back for that question and is left behind for that
   model once a second answer confirms it — ollama's Responses route returns an empty logprob list,
   llama.cpp's refuses the fields, OpenRouter's refuses the logprob includable outright — so later calls start
@@ -158,6 +177,11 @@ The state goes last (`system`, examples, question block, state) so a rubric's ca
 prefix; a chat-list `state` carrying its own `system`/`developer` turn has that content folded into jevper's
 system prompt, because a system turn after a user turn is a `400` on vLLM and SGLang and a 500 on
 llama.cpp's Qwen template. Keep a `state` list to `system`/`user`/`assistant` turns.
+
+Every string that reaches the wire is checked for encodability first: an unpaired surrogate in the state, a
+state turn, a question, the model id, `prompt_cache_key` or `extra_body` is a local error naming the field,
+rather than a serializer failure or a cache-key hash that fails further in. Ordinary non-ASCII text is
+untouched.
 
 The state is the content under judgement, so it is treated as data rather than as instructions: a one-value
 state is wrapped in `<document>` markers with its angle brackets escaped to their JSON form, a hoisted
@@ -260,8 +284,8 @@ verified against MLflow 3.16.1, is the library's `docs/mlflow.md`; the extra is
 | `normalize_probabilities` | `True` | `False` returns the model's `structured` numbers verbatim — the provider's own values, a mass above 1 included, with the error still recorded in `debug`; a negative or non-finite value is a `MalformedAnswerError` either way. A `Score` is still read off the rescaled distribution, so `score` stays on the 0..N-1 line while the reported probabilities do not |
 | `max_concurrency` | `8` | your provider rate-limits per key |
 | `n_retry_malformed` | `1` | a model that keeps answering in prose |
-| `retry` | `RetryPolicy()` | transient-failure retries: `n_retries=2`, `base_delay=0.5`, `max_delay=8.0`, `respect_retry_after=True` — a `Retry-After` header (delta-seconds or an HTTP date) or a numeric `retry-after-ms` replaces the backoff, which `max_delay` does not cap; set it `False` for the curve alone |
-| `extra_body`, `extra_headers` | `None` | provider-specific fields — including `max_tokens` on the Messages surface, where jevper's `1024` default may be too small, and the local servers' `chat_template_kwargs` that turns thinking off. A key named here is what reaches the wire (the SDK merges `extra_body` last), so it also wins over jevper's own value for that field; jevper's own copy of a capability field is dropped with it when a server refuses that field |
+| `retry` | `RetryPolicy()` | transient-failure retries: `n_retries=2`, `base_delay=0.5`, `max_delay=8.0`, `respect_retry_after=True`. The transient set is `408`, `409`, `429` and any `5xx`, plus connection and timeout errors matched by class name (a `ConnectionProgrammingError` of your own is not one); an `x-should-retry` header outranks it in both directions. A `Retry-After` (delta-seconds or an HTTP date) or a numeric `retry-after-ms` replaces the backoff, which `max_delay` does not cap and a 24-hour ceiling does; `respect_retry_after=False` keeps the curve alone. An official SDK's own retry loop is disabled on the copy jevper makes, so `usage.n_retries` counts every retry — your client keeps its own setting |
+| `extra_body`, `extra_headers` | `None` | provider-specific fields — including `max_tokens` on the Messages surface, where jevper's `1024` default may be too small, and the local servers' `chat_template_kwargs` that turns thinking off. A key named here is what reaches the wire (the SDK merges `extra_body` last), so it also wins over jevper's own value for that field; jevper's own copy of a capability field is dropped with it when a server refuses that field. Two keys are refused locally instead: `model` (use `model=`, which is validated and hashed into the cache key) and a truthy `stream` (jevper reads one whole non-streaming response). `{"logprobs": false}` switches the request's logprob fields off on both OpenAI surfaces; `{"logprobs": true}` does not suppress jevper's `top_logprobs`. A header named in a different case replaces the SDK's own rather than adding a second credential |
 
 Constructor misuse (unknown `method`/`api`, a count option that is not an integer, `top_logprobs` outside
 `[0, 20]` or below 2 with a pinned label method, `max_concurrency < 1`, a negative retry field, a blank or
