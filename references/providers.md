@@ -24,7 +24,7 @@ starting point rather than a law, and let `auto` verify it per `(model, surface)
 | Ollama | partial | local builds since Nov 2025 return them on Chat Completions; its `/v1/responses` route returns an empty logprob list. Ollama Cloud and older builds report none |
 | llama.cpp | yes | Chat Completions only: the `/v1/responses` shim refuses the fields (`400 top_logprobs requires logprobs to be set to true`), so `auto` re-asks on Chat Completions |
 | vLLM | yes | caps `top_logprobs` at `--max-logprobs` (20 by default); its `/v1/responses` carries them through `include` |
-| SGLang | yes | its `/v1/responses` needs `top_logprobs` sent explicitly (it defaults to 0) — jevper always sends it |
+| SGLang | yes | its `/v1/responses` needs `top_logprobs` sent explicitly (it defaults to 0) — jevper sends it for `logprobs` and `grammar`, not for `structured`/`discrete` |
 | OpenRouter | per model | it routes by price, and the endpoint it picks may ignore `logprobs`; add `extra_body={"provider": {"require_parameters": True}}` to route only to endpoints that support every field you send. Its Responses API refuses the logprob includable (`400 Invalid option: expected one of …` at `path: ["include", 0]`), so a label readout there moves to Chat Completions, where the distribution arrives — with a pinned `method="logprobs"` as much as with `auto` |
 | everything else | unknown | reasoning models and thin compatibility layers are the ones that say no |
 
@@ -93,9 +93,10 @@ OpenRouter's Responses API is stateless — `store: true` or a `previous_respons
 `store=false` jevper already sends is the form it accepts, and the whole history travels in `input` each call.
 
 **The Responses route speaks two dialects.** `/v1/responses` is both OpenAI's Responses API and the
-[OpenResponses](https://www.openresponses.org) specification (current release `2026-04-24`), which LM Studio
-implements since 0.3.39 and which vLLM says its route "aligns with"; llama.cpp and SGLang serve it too, and
-ollama answers the measured shapes. jevper does not negotiate a dialect — there is no version header and no
+[OpenResponses](https://www.openresponses.org) specification (current release `2026-04-24`). LM Studio is a
+listed implementer and vLLM says its route "aligns with" it; llama.cpp, SGLang and ollama answer the
+measured shapes, and broader dialect support is unverified here. jevper does not negotiate a dialect —
+there is no version header and no
 `Accept` switch — it sends the intersection: every input turn a typed `{"type": "message", ...}` item (OpenAI
 accepts the same, the spec's union requires the `type`) with its content a plain string. Measured across the
 five local servers, both that and `input_text` parts are accepted; the string form is what jevper sends
@@ -165,7 +166,7 @@ A local server is the same client with a different `base_url`. Checked on one 12
 | ollama | `http://127.0.0.1:11434/v1` | the tag you pulled | Chat: `extra_body={"reasoning_effort": "none"}`; Responses: `{"reasoning": {"effort": "none"}}` | Chat Completions carries logprobs; the Responses route returns an empty logprob list and ignores `reasoning_effort` |
 | llama.cpp | `http://127.0.0.1:8080/v1` | the `--alias` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--jinja`; the only server that honours `grammar`. Its Responses route accepts `text.format` and ignores it, while Chat Completions turns the schema into an enforced grammar — structured work belongs on Chat |
 | vLLM | `http://127.0.0.1:8000/v1` | the `--served-model-name` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--reasoning-parser qwen3`; `top_logprobs` capped by `--max-logprobs` (20) |
-| SGLang | `http://127.0.0.1:30000/v1` | the `--served-model-name` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--reasoning-parser qwen3`; its Responses route needs `top_logprobs`, which jevper always sends |
+| SGLang | `http://127.0.0.1:30000/v1` | the `--served-model-name` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--reasoning-parser qwen3`; its Responses logprob route needs `top_logprobs`, which jevper sends for `logprobs`/`grammar` |
 | LM Studio | `http://127.0.0.1:1234/v1` | the id `lms ls` prints | nothing reliably — load an instruct model | all three surfaces on one box, as on the other four; logprobs arrive on both OpenAI surfaces, but its Responses route ignores the schema, so structured answers belong on Chat Completions |
 
 **The OpenResponses route, measured.** Raw HTTP against `/v1/responses` on the 0.7.0 sweep, same card and
@@ -232,7 +233,8 @@ message, and 512 left room for the answer.) The ollama row above is the Chat for
   had listed as unmeasured. An out-of-range `Noul` is reported in the provider's words —
   `'noul' must be in [0, 1.0], got 521304.0` — and the next question answers normally.
 - **No server refuses a long cache key**: 64, 72 and 256 characters were all accepted by vLLM, SGLang and
-  ollama, and OpenRouter took 72, against OpenAI's own 64-character limit. jevper's local ceiling is 256.
+  ollama, and OpenRouter took 72. jevper's local ceiling is 256; the OpenResponses schema documents 64, but
+  OpenAI's own API reference states no length limit.
 - **A real call's `debug` carries the model and the request and neither the API key nor the `base_url`**, and
   a credential-looking header value is recorded as `<redacted>`.
 
@@ -301,10 +303,11 @@ fits a 12 GB card.
 
 ## The Messages route
 
-Every server here also implements the Anthropic Messages API (`POST /v1/messages`), so `api="messages"`
+Every server here also answers the Anthropic Messages API (`POST /v1/messages`), so `api="messages"`
 works against each of them: an `anthropic.Anthropic` client pointed at the same host and port as the OpenAI
-one, passed in place of it. What differs is how much of the protocol each implements — the version is the
-first release that ships the route. LM Studio serves it too, and OpenRouter implements it as its Anthropic
+one, passed in place of it. What differs is how much of the protocol each implements — the version column
+below is unmeasured historical metadata, not a finding from the dated run. LM Studio serves it too, and
+OpenRouter implements it as its Anthropic
 skin (`ANTHROPIC_BASE_URL=https://openrouter.ai/api`, documented by OpenRouter rather than measured here).
 
 | Server | Since | `thinking` field | Thinking blocks back | `usage` cache counts |
@@ -329,20 +332,23 @@ Four protocol facts shape what the client does on this surface:
   while llama.cpp and LM Studio accept the field and ignore it. ollama and SGLang accept it too, but with
   a thinking model nothing comes back on that route to enforce it — a 1024-token request returns empty with
   `stop_reason: "max_tokens"` with the field, with a nonsense one, and with no field at all.
-- **`max_tokens` is required** by vLLM's and SGLang's implementations and has no default on any of them, so
-  jevper always sends one: `1024`, or `1024` plus the caller's `ReasoningConfig(budget_tokens=n)`, because
-  this API also requires the thinking budget to be strictly *below* `max_tokens` and would refuse the 1024
-  its own documentation calls the floor. `extra_body={"max_tokens": n}` wins outright, and a value too small
-  to hold the budget raises `JevperError` locally, naming both numbers. Measured on all five:
+- **`max_tokens` is always sent** on this surface, independent of what an individual local implementation
+  requires: `1024`, or `1024` plus the caller's `ReasoningConfig(budget_tokens=n)` when resolved native
+  reasoning is in play, because this API also requires the thinking budget to be strictly *below*
+  `max_tokens` and would refuse the 1024 its own documentation calls the floor. An explicit
+  `mode="two_step"` supplies no config `thinking` and leaves the default at `1024`.
+  `extra_body={"max_tokens": n}` wins outright, and a value too small to
+  hold the budget raises `JevperError` locally, naming both numbers. Measured on all five:
   a 1024 budget sends `max_tokens: 2048`, a 2048 budget sends `3072`. Thinking is a budget, not an effort
   name: `ReasoningConfig(budget_tokens=n)` sends `thinking={"type": "enabled", ...}` and `effort` is never
   translated into one. A server that refuses the *value* (`budget_tokens: must be at least 1024`) keeps its
   own error rather than being re-asked with your reasoning silently switched off; one that does not know the
   field at all has it dropped and the call re-asked, reported in `debug["server_limits"]["thinking"]`.
-- **jevper's own `temperature` is left out of a Messages request that enables `thinking`** — the API refuses
-  a non-default temperature beside thinking. A temperature you name in `extra_body` still reaches the
-  request, and the provider may refuse it. Set it on the OpenAI surfaces, or turn thinking off, if you were
-  counting on it.
+- **jevper's own `temperature` is left out of a Messages request that enables `thinking`**, and the newest
+  Claude models refuse *any* non-default `temperature` with a `400` whether thinking is on or off (they
+  likewise reject non-default `top_p` and `top_k`). A temperature you name in `extra_body` still reaches the
+  request, and the provider may refuse it. Set it on the OpenAI surfaces; on current Claude, turn thinking
+  off *and* leave the sampling fields at their defaults.
 - **A `system` role inside `messages` is not part of the API** — Anthropic has since added mid-conversation
   `system` messages, but none of these servers implements them, rendering a `system` turn positionally into
   the chat template instead — so jevper moves it to the top-level `system` field, where it cannot be dropped

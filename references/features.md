@@ -31,8 +31,9 @@ of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; `summary` is `aut
 - **Two-step is two provider calls per question**, so roughly twice the cost: an analysis pass (plain text,
   no schema, no logprobs, few-shot turns included) whose output is replayed as an assistant turn before the
   answer pass. `usage.n_calls` counts both.
-- On the chat surface a two-step analysis call sends no reasoning parameters at all — the analysis prompt
-  *is* the reasoning step. Use `mode="native"` if you want the provider's own reasoning there.
+- On the chat surface a two-step analysis call sends no `reasoning_effort` of its own — the analysis prompt
+  *is* the reasoning step — though a `reasoning_effort` you put in `extra_body` still reaches the wire. Use
+  `mode="native"` if you want the provider's own reasoning there.
 - `budget_tokens` is the Messages surface's thinking budget and is ignored by the other two, which carry
   `reasoning_effort` and `reasoning` instead. `effort` is never translated into a budget — that mapping is
   yours — so a Messages request without `budget_tokens` sends no `thinking` field at all and the model's own
@@ -186,7 +187,8 @@ constraint says. Sum-to-one stays client-side: JSON Schema cannot express it.
   llama.cpp's refuses the fields, OpenRouter's refuses the logprob includable outright — so later calls start
   where the distribution is, and a distribution arriving later on a marked surface clears the mark. With no
   surface left to move to, the readout falls back to `structured`; `reasoning="native"` stops the move
-  (native reasoning exists only on Responses), and so does a `grammar` request, which is a Chat Completions
+  (a native plan is not Responses-only — the Messages surface resolves to native when `budget_tokens` is
+  set), and so does a `grammar` request, which is a Chat Completions
   convention the other surface cannot carry.
 - A **pinned `method="logprobs"` moves too**, keeping its method: it asked for a distribution, not for a
   particular surface to produce one, and the surface that refuses is not the method the caller chose. It is
@@ -239,9 +241,10 @@ Every request carries `prompt_cache_key`, on both surfaces:
 Either way it travels in the **request body**, never as an SDK keyword: `openai` 1.92 — the oldest version
 jevper is tested against, and the first whose `responses.create` accepts `top_logprobs` — has no typed
 parameter for the field, and sending one anyway raised `TypeError` inside the SDK on every call and every
-surface. The wire field is the API's own, so the key is yours to choose without an SDK upgrade; OpenAI
-validates it at 64 characters while jevper's own limit is 256, and a key past the provider's limit is the
-provider's `400` to return, not a local refusal.
+surface. The wire field is the API's own, so the key is yours to choose without an SDK upgrade. jevper's own
+ceiling is 256 characters; the [OpenResponses schema](https://github.com/openresponses/openresponses/blob/main/public/openapi/openapi.json)
+documents a 64-character maximum for it, but OpenAI's own API reference states no length limit, so a key past
+whatever a provider enforces is that provider's `400` to return, not a local refusal.
 
 `usage.cached_tokens` is what the provider read from its cache, taken from `usage.prompt_tokens_details` on
 Chat Completions, `usage.input_tokens_details` on Responses or `usage.cache_read_input_tokens` on Messages.

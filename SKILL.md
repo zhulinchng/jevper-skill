@@ -71,7 +71,9 @@ in one user turn; a list of dicts is read as chat turns, a list of anything else
   certainty (1). For `score` it is `max(0, 1 − MAD/MAD_uniform)`. `noul` has none, and `discrete` (one-hot)
   always yields `1.0`.
 - Read answers as `response.answers["id"]`, or the filtered views `response.choices` / `.nouls` /
-  `.scores`. `response.model_dump_json()` emits the Jev wire shape (`type`/`choice`/`probabilities`/…).
+  `.scores`. `response.model_dump_json()` keeps the Jev answer field names and keys
+  (`type`/`choice`/`probabilities`/…) and wraps them in jevper's own `model`, `usage`, `reasoning` and
+  `debug`.
 
 ## Methods: leave `method` unset
 
@@ -87,10 +89,13 @@ never implemented logprobs.
 | `discrete` | one option as JSON | one-hot over the choice |
 
 What `auto` does, so you can rely on it: the verdict is made per `(model, surface)` by observation and
-remembered for the life of the client; a `Choice` with more than 26 options goes straight to JSON. Three
-things count as "this provider cannot do logprobs" — a `400`/`403`/`422` that names the logprob fields (any
-other status is not capability evidence, whatever its text says), an answer with no logprobs at all, or an
-answer token with no usable rival among the options. A rejection is remembered at once; a response that
+remembered for the life of the client; a `Choice` with more than 26 options goes straight to JSON. Four
+kinds of evidence count as "this provider cannot do logprobs" — a `400`/`403`/`422` that names the logprob
+fields (any other status is not capability evidence, whatever its text says), a Responses request refused
+for its `include` entry without ever saying "logprob" (OpenRouter: `400 Invalid option: expected one of …`
+for `path: ["include", 0]`; OpenAI: `400 Unsupported parameter: 'include' is not supported with this
+model.`), an answer with no logprobs at all, or an answer token with no usable rival among the options. A
+rejection is remembered at once; a response that
 merely lacks logprobs falls back for that question but is written off only after a second one. A rejection
 complaining only about a *value* (a server whose `top_logprobs` cap is lower than 20) is never remembered,
 and a 5xx that survives retries falls back for that question alone, under `auto` — pin a label method and
@@ -129,8 +134,9 @@ which `mode="auto"` selects on its own; a server that does not know the field (S
 the call re-asked, while one that refuses the number gets its own error back.
 
 The `responses` surface carries two dialects at one path: OpenAI's Responses API and the
-[OpenResponses](https://www.openresponses.org) specification, which LM Studio, llama.cpp, vLLM and SGLang
-serve at the same `/v1/responses` (ollama accepts the measured shapes too). jevper sends the portable form
+[OpenResponses](https://www.openresponses.org) specification. LM Studio is a listed implementer and vLLM
+says its route aligns with it; llama.cpp, SGLang and ollama answer the measured shapes, and broader
+dialect support is unverified here. jevper sends the portable form
 — every input turn a typed `{"type": "message", ...}` item, content a plain string, which both dialects
 accept — and reads either back: text parts named `text`/`input_text` as well as `output_text`, several
 messages per response (`phase: "commentary"` then `final_answer`, only the last read), an own `status` per
@@ -194,8 +200,9 @@ model, the method, the example turns and the question block — the method belon
 prompt and answer shape are part of the cached prefix, so a `logprobs` request must not be routed into a
 `structured` one's bucket. The state is not part of it, so one rubric's calls route to the same cache, and
 both passes of a two-step call share one key. It travels in the **request body**, never as an SDK keyword,
-so an `openai` older than the field still carries it; OpenAI's own limit is 64 characters and jevper's
-local one 256, so a longer key is left for the provider to judge.
+so an `openai` older than the field still carries it. jevper's local ceiling is 256 characters; the
+OpenResponses schema documents a 64-character maximum, but OpenAI's own API reference states no length
+limit, so a longer key is left for the provider to judge.
 
 `usage.cached_tokens` is what the provider read from its cache, `None` when it said nothing, and `0` for a
 cold or disabled one: vLLM reports it only with `--enable-prompt-tokens-details`, SGLang's Chat route only
@@ -216,9 +223,9 @@ Four groups, and only the two middle ones are worth catching for control flow:
 | `InvalidQuestionError`, `UnsupportedMethodError`, `ClientCapabilityError` | before any request: a question or example that is invalid **wherever it is built** — `Choice(criteria={})` raises it, and so does the mapping handed to `system_one`, so one `except JevperError` covers a rubric written in Python and one loaded from data. An example's answer and its own numbers are checked against the question that carries it at construction; `examples=` passed to the client or the call have no question to check against until the call pairs them with one, so they are checked there, still before any request. Then `grammar` on the wrong surface or `logprobs`/`grammar` on the Messages surface, a client missing the attribute a surface needs, or an `extra_headers` name that is not an HTTP token or a value that is not printable ASCII (a CRLF, NUL, non-ASCII or lone surrogate is refused here, not sent) — plus, after one, a JSON body carrying no usable first choice and no explanation of why. An event *stream* is not in this row any more: it is `ProviderError` on all three surfaces | fix the code; the first three cost nothing, and the last is never retried |
 | `LabelReadoutError`, `MalformedAnswerError` | the answer came back but could not be read; a model-side failure gets one corrective retry by default (`n_retry_malformed`) with a correction turn, while a provider that does not report logprobs at all is never corrected | usually leave it alone; `auto` turns the provider-side cases into `structured` instead |
 | `IncompleteAnswerError`, `ModelRefusalError` | the provider stopped generating before the answer was complete (a spent output budget, or a context window too small) or reported that the model declined or was filtered — `refusal`, `content_filter` alike, since a second attempt is filtered the same way — both are `ProviderError` subclasses raised *before* any readout, because a cut-off, declined or withheld generation is not an answer to correct | fix the request, not the reader: turn thinking off, raise the cap the surface names (`max_output_tokens` on Responses, `max_tokens` on Chat and Messages) or shorten the state; a refusal needs a different request or model, and a retry is refused the same way |
-| `ProviderError` | a provider call failed — retried while the failure is transient, which is the set below — and `.attempts`/`.status_code` hold the history, including a status carried inside a `200` body (OpenRouter: `embedded=True`, and its answer, if any, loses to the error beside it), a Responses status that is neither `completed` nor `incomplete` or an output item still `in_progress`, and a non-streaming request answered with an event stream. In that last case the stream is read for the provider's own failure — `event: error`, OpenAI's typed `response.failed`, or a bare `{"error": …}` — and that error's status decides the retry, so a `429` inside a `200` is retried; a stream carrying no failure is a protocol mismatch whose message names the surface. It is also what you get when no surface the client can speak has the route, and that route verdict is remembered, so a client that can speak neither pays the same 404 on every call | the one to catch at a service boundary; retry it yourself only for the transient set — a missing route, a terminal generation and a stream will all fail again |
+| `ProviderError` | a provider call failed — a transient one after its retries are exhausted, or a non-transient one at once. `.attempts`/`.status_code` hold the history, including a status carried inside a `200` body (OpenRouter: `embedded=True`, and its answer, if any, loses to the error beside it), a Responses status that is neither `completed` nor `incomplete` or an output item still `in_progress`, and a non-streaming request answered with an event stream. In that last case the stream is read for the provider's own failure — `event: error`, OpenAI's typed `response.failed`, or a bare `{"error": …}` — and that error's status decides the retry, so a `429` inside a `200` is retried; a stream carrying no failure is a protocol mismatch whose message names the surface. It is also what you get when no surface the client can speak has the route, and that route verdict is remembered, so a client that can speak neither pays the same 404 on every call | the one to catch at a service boundary; retry it yourself only for the transient set — a missing route, a terminal generation and a stream will all fail again |
 
-`JevperError` is the base class — catch it if you want one handler for everything, including constructor
+`JevperError` is the base class — catch it for every error jevper raises, including constructor
 misuse (a count option that is not an integer or out of range, a blank `model`, an unknown `method`/`api`, a
 header name or value the HTTP layer could not carry), a bad `state` message, content that is not
 JSON-serializable or carries a non-finite number, a string that cannot be encoded as UTF-8 in the state,
