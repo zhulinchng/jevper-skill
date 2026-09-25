@@ -8,7 +8,7 @@
 
 ## Does this provider do logprobs?
 
-Observed against each provider's live API, as of jevper 0.7.0 — providers move, so treat a row as a
+Observed against each provider's live API, as of jevper 0.7.2 — providers move, so treat a row as a
 starting point rather than a law, and let `auto` verify it per `(model, surface)` for you.
 
 | Provider | `logprobs` | Note |
@@ -118,12 +118,15 @@ more `MalformedAnswerError`s, set `temperature=0.0`, and keep the criteria descr
 A client object cannot say whether the *server* implements a route — `openai.OpenAI` exposes
 `responses.create` either way — so `auto` reads the responses:
 
-- **404 that does not quote the model id together with "model", "no such" or "not exist"** → the route is
+- **404 that does not say the model does not exist** → the route is
   missing: the call is re-asked on the other surface and remembered for the client's life — but only where
   the client can speak it. A Messages-only client whose host has no `/v1/messages` route keeps re-asking and
   keeps reporting the 404 (`ProviderError`, `status_code=404`) rather than moving to an attribute it does not
-  have. `ollama` and `vLLM` answer a bad model id that way; those are reported as they stand, on either
-  surface.
+  have. "Says the model does not exist" means the message quotes the model id beside `model`/`no such`/
+  `not exist`, **or** the error's `code` is one of `model_not_found`, `model_not_exist`,
+  `model_does_not_exist`, `unknown_model`, `invalid_model`, `unsupported_model` — a body that carries
+  nothing else is the only field a provider reliably fills in. `ollama` and `vLLM` answer a bad model id by
+  naming it; those are reported as they stand, on either surface.
 - **A surface that answers without a distribution** → left behind for that model after a second confirming
   answer (a refusal is believed at once): ollama's Responses route returns an empty logprob list, llama.cpp's
   refuses the fields and OpenRouter's refuses the includable, while Chat Completions on all three carries the
@@ -137,8 +140,11 @@ When a server refuses a request field jevper added — `response_format`, `text.
 `reasoning`, the `include` list, `prompt_cache_key`, or the Messages `output_config` and `thinking` fields —
 the field is dropped and the same call re-asked, one step down the ladder at a time
 (`json_schema` → `json_object` → nothing; on the Messages surface the only rung is `output_config`, where the
-prompt is where the schema lived before the field existed), remembered per surface and reported in
-`debug["server_limits"]` for the surface that answered. None of them is needed to answer the question.
+prompt is where the schema lived before the field existed), remembered **per (model, surface)** and reported in
+`debug["server_limits"]` for the surface that answered. A refusal earned by one model is not carried to the
+next, so a server that refuses the field for every model is charged one discovery request per model; a call
+that used two surfaces reports each in `debug["server_limits_by_api"]`. None of them is needed to answer the
+question.
 
 ## Local servers
 
@@ -148,7 +154,7 @@ A local server is the same client with a different `base_url`. Checked on one 12
 
 | Server | `base_url` | `model` | Thinking off | Notes |
 | --- | --- | --- | --- | --- |
-| ollama | `http://127.0.0.1:11434/v1` | the tag you pulled | `extra_body={"reasoning_effort": "none"}` | Chat Completions carries logprobs; the Responses route returns an empty logprob list |
+| ollama | `http://127.0.0.1:11434/v1` | the tag you pulled | Chat: `extra_body={"reasoning_effort": "none"}`; Responses: `{"reasoning": {"effort": "none"}}` | Chat Completions carries logprobs; the Responses route returns an empty logprob list and ignores `reasoning_effort` |
 | llama.cpp | `http://127.0.0.1:8080/v1` | the `--alias` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--jinja`; the only server that honours `grammar`. Its Responses route accepts `text.format` and ignores it, while Chat Completions turns the schema into an enforced grammar — structured work belongs on Chat |
 | vLLM | `http://127.0.0.1:8000/v1` | the `--served-model-name` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--reasoning-parser qwen3`; `top_logprobs` capped by `--max-logprobs` (20) |
 | SGLang | `http://127.0.0.1:30000/v1` | the `--served-model-name` value | `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` | serve with `--reasoning-parser qwen3`; its Responses route needs `top_logprobs`, which jevper always sends |
@@ -180,10 +186,34 @@ for the answer token on ollama, llama.cpp and SGLang (measured here), and the li
 and LM Studio; `n: 2` is *not* portable: vLLM and SGLang return two choices, ollama and LM Studio accept
 the field and answer once, and llama.cpp refuses it when it serves one slot
 (`400 Field 'n': Value must be between 1 <= value <= 1, but got 2`).
-One more ollama-specific trap, measured: the thinking-off knob reaches its Chat route but **not** its
-Responses route. The same request with `max_output_tokens: 96` came back `completed` with a reasoning item
-and an **empty** message, and 512 tokens left room for the answer — so on that route a small budget looks
-like a server that has nothing to say, and raising it is the fix rather than the thinking toggle.
+One ollama-specific correction, measured on the 0.7.1 sweep: `reasoning_effort` reaches its Chat route and
+is **ignored on its Responses route**, where the field that works is `reasoning={"effort": "none"}` — with
+the wrong one the answers come back carrying the trace and sometimes with no text at all. (A small output
+budget looks like the same fault and is not: `max_output_tokens: 96` returned `completed` with an empty
+message, and 512 left room for the answer.) The ollama row above is the Chat form.
+
+**What the 0.7.1 sweep added**, 18 scenarios per server on the same card and models:
+
+- **`"stream": 0` in the request body is a caller error on three of the five**, in three different words:
+  llama.cpp `400 Field 'stream': type must be boolean, but is number`, ollama `400 invalid stream value:
+  json: cannot unmarshal number into Go value of type bool`, LM Studio `400 Expected boolean, received
+  number`. vLLM accepts it (its model coerces `0` to `false`) and SGLang does not object either. jevper
+  refuses a *truthy* `stream` itself, so these are yours: omit the field or send `false`.
+- **A 26-option question is where a 4B model shows.** On SGLang the label readout answered and reported all
+  26 probabilities; on vLLM and LM Studio the model answered in prose whose first token was `no`, and jevper
+  raised `LabelReadoutError` after its corrective retry. `method="structured"` returns all 26 keys
+  everywhere it was tried.
+- **`grammar` is llama.cpp's alone, with a result**: its clean-state readout came back above `0.9999`
+  confidence. The other four ignore the GBNF field, so a label readout can read a non-label first token —
+  `auto` walks the ladder for them instead.
+- **A `Score` over the model's own numbers is exactly the expectation**: `{0: 0.1, 1: 0.9}` → `0.9` and
+  `{2: 0.2, 3: 0.7, 4: 0.1}` → `2.9` with `normalize_probabilities=False`, the one path the 0.7.0 notes
+  had listed as unmeasured. An out-of-range `Noul` is reported in the provider's words —
+  `'noul' must be in [0, 1.0], got 521304.0` — and the next question answers normally.
+- **No server refuses a long cache key**: 64, 72 and 256 characters were all accepted by vLLM, SGLang and
+  ollama, and OpenRouter took 72, against OpenAI's own 64-character limit. jevper's local ceiling is 256.
+- **A real call's `debug` carries the model and the request and neither the API key nor the `base_url`**, and
+  a credential-looking header value is recorded as `<redacted>`.
 
 `api="auto"` works against all five: it prefers Responses, and when that route is missing or answers
 without a distribution it re-asks on Chat Completions and remembers the verdict. `api="chat_completions"`
@@ -206,7 +236,8 @@ whole output budget on the trace and leave nothing to read, which ends the call.
 Measured on `qwen3:4b-thinking-2507` through ollama 0.34.3: `extra_body={"reasoning_effort": "none"}` does
 reach the template and does change the answer — to prose (`First …`), which a label readout cannot read, so
 the error names that first token. A thinking model there wants its own `think` setting through ollama's
-native API, or a non-thinking model.
+native API, or a non-thinking model. On ollama's *Responses* route the same `reasoning_effort` is ignored
+entirely: the field that works there is `reasoning={"effort": "none"}`.
 
 A label readout also survives thinking when the server separates the trace *and* the token stream ends
 exactly with the answer text: jevper anchors on that tail and reads the answer's own first token. The
@@ -217,7 +248,7 @@ dropped before the tail is tested.
 All five ignore unknown request fields, so a field that does not apply is not an error. Two exceptions,
 and the silent ones:
 
-- `grammar` is a llama.cpp convention — ollama, vLLM and SGLang ignore it, the model answers
+- `grammar` is a llama.cpp convention — the other four ignore it, the model answers
   unconstrained, and the label readout reports a non-label first token instead of a grammar failure.
 - `reasoning_effort` reaches the chat template on ollama, llama.cpp and SGLang; vLLM validates it against
   its own enum and answers `400` for a value outside it (`xhigh` and `max` are the usual casualties).
@@ -304,9 +335,11 @@ reasoning only, or `IncompleteAnswerError` when the trace spent the output budge
 `stop_reason: "max_tokens"`. Turn thinking off per call exactly as on the other surfaces
 (`extra_body={"chat_template_kwargs": {"enable_thinking": False}}`, or
 `{"reasoning_effort": "none"}` on ollama) — that body reaches this surface whatever else is on the request,
-so the knob is not silently dropped, and with it vLLM's route answers. It is not enough everywhere: measured
-again on 0.7.0, ollama and SGLang still spend a 1024-token budget on a thinking model's trace and return no
-text, so on those two use the OpenAI surfaces or `extra_body={"max_tokens": 2048}`. SGLang needs one more
+so the knob is not silently dropped, and with it vLLM's route answers. It is not enough everywhere:
+SGLang's Messages route spends a 1024-token budget on a thinking model's trace and returns no text, so
+there use the OpenAI surfaces or `extra_body={"max_tokens": 2048}`, and check the reasoning field for the
+surface you are on (ollama's Messages route takes the same `{"reasoning_effort": "none"}` as its Chat one).
+SGLang needs one more
 server-side decision: with `--reasoning-parser qwen3` and a
 *non-thinking* model, whose template has no `enable_thinking` to set, the parser never sees the closing
 marker it waits for and classifies the whole generation as reasoning — dropping `--reasoning-parser` fixes

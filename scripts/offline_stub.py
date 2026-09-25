@@ -60,6 +60,21 @@ Scenarios:
     reasoning            a chat-surface two-step sequence: analysis text, then the answer
     reasoning_only       a server whose reasoning parser put the whole generation in a thinking block:
                          no answer text at all
+    stream_error           a Responses error carried in an SSE frame, with the provider's status
+    stream_error_chat      the same failure on Chat, in a proxy's plainer error-event shape
+    stream_split_data      one SSE error frame whose JSON is written across several ``data:`` lines
+    stream_mismatch        a non-streaming request answered with a stream that carries no failure
+    response_failed        OpenAI's typed ``response.failed`` event, whose nested error has no status
+    model_not_found        a 404 whose code names a missing model, not a missing route
+    header_crlf            a header value that could inject a second header
+    self_referential_body  an ``extra_body`` structure that contains itself
+    extra_root_key         a structured answer with one field too many at its root
+    deep_json              a structured answer nested past Python's JSON recursion limit
+    score_decimal          a discrete score written as an integral decimal string
+    unicode_label          a discrete choice where ASCII folding must not absorb a Unicode lookalike
+    redacted_header        a credential header kept by name but removed from recorded values and errors
+
+It needs jevper 0.7.2 or newer.
 
 Knobs: ``surface`` (``chat_completions``, ``responses``, ``messages`` or ``both``, default ``both`` — the
 endpoints this client exposes, as ``openai.OpenAI`` exposes the first two and ``anthropic.Anthropic`` the
@@ -70,8 +85,9 @@ probabilities a model states itself, replacing the stub's own distribution — a
 up to 1, which is what ``normalize_probabilities=False`` hands back verbatim), ``reject_status`` and
 ``retry_headers`` (the status and response headers on the ``transient`` scenario's first refusal, the way
 the SDKs surface them, so the retry rules can be exercised without a clock). ``requests`` records what
-each call put on the wire — the kwargs with ``extra_body`` merged in, as the SDK merges it — and
-``surfaces`` the endpoint each one went to, in the same order.
+each call put on the wire — the kwargs with ``extra_body`` merged in, as the SDK merges it, with
+credential header values replaced by ``<redacted>`` for safe inspection — and ``surfaces`` the endpoint
+each one went to, in the same order.
 
 Self-test with ``python offline_stub.py --check``; probe a real provider with
 ``python offline_stub.py --live --model <id>`` (add ``--extra-body '{...}'`` for request fields, e.g. the
@@ -121,6 +137,19 @@ SCENARIOS = (
     "reject_reasoning_include",
     "reasoning",
     "reasoning_only",
+    "stream_error",
+    "stream_error_chat",
+    "stream_split_data",
+    "stream_mismatch",
+    "response_failed",
+    "model_not_found",
+    "header_crlf",
+    "self_referential_body",
+    "extra_root_key",
+    "deep_json",
+    "score_decimal",
+    "unicode_label",
+    "redacted_header",
 )
 SURFACES = ("chat_completions", "responses", "messages", "both")
 
@@ -134,13 +163,14 @@ SCHEMA_MARKER = "JSON Schema:\n"  # jevper puts the schema in the prompt when th
 PROMPT_TOKENS = 2388  # the measured prompt in jevper's docs/local-servers.md
 COMPLETION_TOKENS = 8
 CACHED_TOKENS = 1010  # llama.cpp's reuse for a state-varied second call on that prompt
+BEARER_SECRET = "$" * 2 + "BEARERTOKEN_YVZEFVAZ8UA9:L" + "$" * 2
 
 
 class Rejection(Exception):
-    """A refusal jevper classifies instead of retrying: a capability 400, or a 404 for a whole route.
+    """A provider status error with the attributes the official SDKs expose to jevper.
 
-    ``headers`` and ``status_code`` are the attributes the SDKs put on their own status errors, so the
-    retry rules — which read the status, then ``x-should-retry`` — can be exercised here offline.
+    ``headers`` and ``status_code`` drive the retry rules; ``param`` and ``code`` join the message as
+    evidence, which is how a 404 can name a missing model even when its text does not name the id.
     """
 
     def __init__(
@@ -149,10 +179,14 @@ class Rejection(Exception):
         status_code: int = 400,
         *,
         headers: dict[str, str] | None = None,
+        code: str | None = None,
+        param: str | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.headers = dict(headers or {})
+        self.code = code
+        self.param = param
 
 
 def _wants_logprobs(kwargs: dict[str, Any]) -> bool:
@@ -348,6 +382,12 @@ def _messages_body(
     }
 
 
+def _sse(event: str, data: str | list[str]) -> str:
+    """One SSE event, optionally carrying JSON across the data lines SSE will join again."""
+    lines = [data] if isinstance(data, str) else data
+    return f"event: {event}\n" + "".join(f"data: {line}\n" for line in lines) + "\n"
+
+
 class _Endpoint:
     """One ``create`` method; the surface only decides the body shape."""
 
@@ -355,7 +395,7 @@ class _Endpoint:
         self._stub = stub
         self._surface = surface
 
-    def create(self, **kwargs: Any) -> dict[str, Any]:
+    def create(self, **kwargs: Any) -> Any:
         return self._stub.reply(kwargs, self._surface)
 
 
@@ -416,15 +456,59 @@ class StubClient:
                 tops.append({"token": label, "logprob": -2.0 - 0.6 * index})
         return [{"token": answer, "logprob": ANSWER_LOGPROB, "top_logprobs": tops}]
 
-    def reply(self, kwargs: dict[str, Any], surface: str) -> dict[str, Any]:
+    def reply(self, kwargs: dict[str, Any], surface: str) -> Any:
         # The SDK merges ``extra_body`` into the request *after* the typed parameters, so what reaches
         # the wire is the union with the caller's keys winning. Record that rather than the SDK's calling
         # convention: a check asking what the server saw should not have to merge it itself.
         extra = kwargs.pop("extra_body", None)
         if isinstance(extra, dict):
             kwargs = {**kwargs, **extra}
-        self.requests.append(kwargs)
+        recorded = dict(kwargs)
+        headers = recorded.get("extra_headers")
+        if isinstance(headers, dict):
+            recorded["extra_headers"] = {
+                name: "<redacted>"
+                if isinstance(name, str) and "authorization" in name.casefold() else value
+                for name, value in headers.items()
+            }
+        self.requests.append(recorded)
         self.surfaces.append(surface)
+
+        if self.scenario == "stream_error" and surface == "responses":
+            return _sse("error", json.dumps({
+                "type": "error", "status": 503, "error": {"message": "upstream busy"},
+            }))
+        if self.scenario == "stream_error_chat" and surface == "chat_completions":
+            return _sse("error", json.dumps({
+                "error": {"message": "internal error", "code": 500},
+            }))
+        if self.scenario == "stream_split_data" and surface == "responses":
+            return _sse("error", [
+                '{"type": "error",',
+                '  "status": 429,',
+                '  "error": {"message": "split-frame rate limit"}',
+                "}",
+            ])
+        if self.scenario == "stream_mismatch" and surface in ("chat_completions", "messages"):
+            if surface == "chat_completions":
+                return _sse("message", json.dumps({
+                    "choices": [{"delta": {"content": "A"}}],
+                }))
+            return _sse("content_block_delta", json.dumps({
+                "type": "content_block_delta", "delta": {"type": "text_delta", "text": "A"},
+            }))
+        if self.scenario == "response_failed" and surface == "responses":
+            return _sse("response.failed", json.dumps({
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "error": {"code": "server_error", "message": "The model failed to generate."},
+                },
+            }))
+        if self.scenario == "model_not_found":
+            raise Rejection("Unknown model", status_code=404, code="model_not_found")
+        if self.scenario == "redacted_header" and len(self.requests) > 1:
+            raise Rejection(f"Authorization: Bearer {BEARER_SECRET} was rejected", 401)
 
         if self.scenario == "no_responses_route" and surface == "responses":
             # A server that never implemented the route: a 404 that says nothing about the model.
@@ -482,6 +566,21 @@ class StubClient:
             "responses": _responses_body,
             "messages": _messages_body,
         }[surface]
+        if self.scenario == "extra_root_key":
+            base = _schema_answer(schema, self.winner) or {
+                "probabilities": _distribution(["a", "b"], self.winner),
+            }
+            return body(kwargs, body={**base, "extra": 0.123456789}, cached=self.cached_tokens)
+        if self.scenario == "deep_json":
+            return body(kwargs, text="[" * 1_000_000 + "1" + "]" * 1_000_000, cached=self.cached_tokens)
+        if self.scenario == "score_decimal":
+            # The existing winner knob chooses which real model shape this instance returns.
+            value = "2.000" if self.winner == 0 else "2.0000000000000000000001"
+            return body(kwargs, body={"score": value}, cached=self.cached_tokens)
+        if self.scenario == "unicode_label":
+            labels = (((schema or {}).get("properties") or {}).get("choice") or {}).get("enum") or ()
+            raw = "ı" if len(labels) == 2 else "A"
+            return body(kwargs, body={"choice": raw}, cached=self.cached_tokens)
 
         if self.scenario == "truncated":
             # Generation stopped before an answer existed — the stop reason is the actionable fact, and
@@ -571,8 +670,10 @@ class StubClient:
                 # be trusted, so the answer is refused instead of read from either.
                 entries = self._entries(kwargs)
                 return body(kwargs, text="B. billing", entries=entries, cached=self.cached_tokens)
-            if self.scenario in ("logprobs", "reasoning", "no_responses_route", "reject_include",
-                                 "reject_reasoning_include"):
+            if self.scenario in (
+                "logprobs", "reasoning", "no_responses_route", "reject_include",
+                "reject_reasoning_include", "redacted_header",
+            ):
                 return body(kwargs, entries=self._entries(kwargs), cached=self.cached_tokens)
             return body(kwargs, entries=[], cached=self.cached_tokens)  # no logprobs to give back
 
@@ -611,6 +712,7 @@ def _run_checks() -> int:
         Noul,
         ProviderError,
         ReasoningConfig,
+        RetryPolicy,
         Score,
         SystemOneClient,
         UnsupportedMethodError,
@@ -1708,6 +1810,212 @@ def _run_checks() -> int:
     check("debug: every attempted surface reports its own limits",
           sorted(response.debug.get("server_limits_by_api") or {}) == ["chat_completions", "responses"],
           str(sorted(response.debug.get("server_limits_by_api") or {})))
+
+    # --- jevper 0.7.1/0.7.2: failures and inputs earlier releases read differently -------------------
+
+    # A non-streaming request answered with an event stream is a real provider failure when the frame
+    # names one. Its status travels through the normal retry path, even though the HTTP status was 200.
+    stub = StubClient(scenario="stream_error", surface="responses")
+    try:
+        SystemOneClient(stub, model="stub-model", method="structured", api="responses").system_one(
+            state=state, questions={"intent": question()}
+        )
+    except ProviderError as exc:
+        check("stream_error: an error frame is retried, then reports its 503",
+              exc.status_code == 503 and len(stub.requests) == 3,
+              f"status={exc.status_code} requests={len(stub.requests)}")
+    else:  # pragma: no cover
+        check("stream_error: an error frame is retried, then reports its 503", False, "no error")
+
+    stub = StubClient(scenario="stream_error_chat", surface="chat_completions")
+    try:
+        SystemOneClient(
+            stub, model="stub-model", method="structured", api="chat_completions",
+            retry=RetryPolicy(n_retries=0),
+        ).system_one(state=state, questions={"intent": question()})
+    except ProviderError as exc:
+        check("stream_error_chat: a plain proxy error frame keeps its status and message",
+              exc.status_code == 500 and "internal error" in str(exc) and len(stub.requests) == 1,
+              f"status={exc.status_code} requests={len(stub.requests)} error={exc}")
+    else:  # pragma: no cover
+        check("stream_error_chat: a plain proxy error frame keeps its status and message", False, "no error")
+
+    stub = StubClient(scenario="stream_split_data", surface="responses")
+    try:
+        SystemOneClient(
+            stub, model="stub-model", method="structured", api="responses",
+            retry=RetryPolicy(n_retries=0),
+        ).system_one(state=state, questions={"intent": question()})
+    except ProviderError as exc:
+        check("stream_split_data: joined data lines keep the frame's status and message",
+              exc.status_code == 429 and "split-frame rate limit" in str(exc),
+              f"status={exc.status_code} error={exc}")
+    else:  # pragma: no cover
+        check("stream_split_data: joined data lines keep the frame's status and message", False, "no error")
+
+    # In 0.7.0 this same stream was a ClientCapabilityError on Chat and fell through to
+    # MalformedAnswerError on Messages. Naming the event-stream mismatch on both is deliberate.
+    for surface in ("chat_completions", "messages"):
+        stub = StubClient(scenario="stream_mismatch", surface=surface)
+        try:
+            SystemOneClient(
+                stub, model="stub-model", method="structured", api=surface,
+                n_retry_malformed=0,
+            ).system_one(state=state, questions={"intent": question()})
+        except ProviderError as exc:
+            check(f"stream_mismatch: {surface} names the event-stream protocol mismatch",
+                  "event stream" in str(exc) and len(stub.requests) == 1, str(exc))
+        except JevperError as exc:  # pragma: no cover - the wrong error type
+            check(f"stream_mismatch: {surface} names the event-stream protocol mismatch", False, repr(exc))
+        else:  # pragma: no cover
+            check(f"stream_mismatch: {surface} names the event-stream protocol mismatch", False, "no error")
+
+    stub = StubClient(scenario="response_failed", surface="responses")
+    try:
+        SystemOneClient(
+            stub, model="stub-model", method="structured", api="responses",
+            retry=RetryPolicy(n_retries=0),
+        ).system_one(state=state, questions={"intent": question()})
+    except ProviderError as exc:
+        check("response_failed: the typed event keeps the provider message without inventing a status",
+              "The model failed to generate." in str(exc) and exc.status_code is None, repr(exc))
+    else:  # pragma: no cover
+        check("response_failed: the typed event keeps the provider message without inventing a status",
+              False, "no error")
+
+    stub = StubClient(scenario="model_not_found", surface="both")
+    client = SystemOneClient(stub, model="stub-model")
+    try:
+        answered = client.system_one(state=state, questions={"intent": question()})
+        first_status = None
+    except ProviderError as exc:
+        answered = None
+        first_status = exc.status_code
+    check("model_not_found: a model 404 is not mistaken for a route and answered elsewhere",
+          answered is None and first_status == 404 and stub.surfaces == ["responses"]
+          and all(stub.surfaces.count(name) <= 1 for name in ("responses", "chat_completions")),
+          f"status={first_status} surfaces={stub.surfaces}")
+    try:
+        answered = client.system_one(state=state, questions={"intent": question()})
+        second_status = None
+    except ProviderError as exc:
+        answered = None
+        second_status = exc.status_code
+    check("model_not_found: the second call reports the same 404 rather than a written-off route",
+          answered is None and second_status == 404 and stub.surfaces == ["responses", "responses"],
+          f"status={second_status} surfaces={stub.surfaces}")
+
+    stub = StubClient(scenario="header_crlf")
+    try:
+        SystemOneClient(
+            stub, model="stub-model", extra_headers={"X-Trace": "a\r\nInjected: 1"}
+        )
+    except JevperError as exc:
+        check("header_crlf: a header that could inject another is refused at construction",
+              "X-Trace" in str(exc) and "\\r" in str(exc), str(exc))
+    else:  # pragma: no cover
+        check("header_crlf: a header that could inject another is refused at construction", False, "no error")
+    check("header_crlf: the refused header sends nothing", not stub.requests, str(stub.requests))
+
+    stub = StubClient(scenario="self_referential_body")
+    extra_body: dict[str, Any] = {"safe": True}
+    extra_body["self"] = extra_body
+    try:
+        SystemOneClient(stub, model="stub-model", extra_body=extra_body).system_one(
+            state=state, questions={"intent": question()}
+        )
+    except JevperError as exc:
+        check("self_referential_body: a cyclic extra_body names the field and the cycle",
+              "extra_body" in str(exc) and "refers to itself" in str(exc), str(exc))
+    else:  # pragma: no cover
+        check("self_referential_body: a cyclic extra_body names the field and the cycle", False, "no error")
+    check("self_referential_body: the cyclic extra_body sends nothing", not stub.requests, str(stub.requests))
+
+    stub = StubClient(scenario="extra_root_key", surface="chat_completions")
+    try:
+        SystemOneClient(
+            stub, model="stub-model", method="structured", api="chat_completions",
+            n_retry_malformed=0,
+        ).system_one(state=state, questions={"intent": question()})
+    except MalformedAnswerError as exc:
+        check("extra_root_key: the error names the required and seen keys, but not their values",
+              "exactly" in str(exc) and "'probabilities'" in str(exc) and "'extra'" in str(exc)
+              and "0.123456789" not in str(exc), str(exc))
+    else:  # pragma: no cover
+        check("extra_root_key: the error names the required and seen keys, but not their values",
+              False, "no error")
+
+    stub = StubClient(scenario="deep_json", surface="chat_completions")
+    try:
+        SystemOneClient(
+            stub, model="stub-model", method="structured", api="chat_completions",
+            n_retry_malformed=0,
+        ).system_one(state=state, questions={"intent": question()})
+    except MalformedAnswerError as exc:
+        check("deep_json: over-deep JSON is a MalformedAnswerError, not a RecursionError",
+              "nested too deeply" in str(exc), str(exc))
+    except RecursionError as exc:  # pragma: no cover - the regression this check exists to catch
+        check("deep_json: over-deep JSON is a MalformedAnswerError, not a RecursionError", False, repr(exc))
+    else:  # pragma: no cover
+        check("deep_json: over-deep JSON is a MalformedAnswerError, not a RecursionError", False, "no error")
+
+    score_question = Score(instructions="How bad is it?", criteria=["a", "b", "c"])
+    stub = StubClient(scenario="score_decimal", surface="chat_completions")
+    response = SystemOneClient(
+        stub, model="stub-model", method="discrete", api="chat_completions"
+    ).system_one(state=state, questions={"level": score_question})
+    check("score_decimal: an integral decimal string answers the exact level",
+          response.answers["level"].score == 2, str(response.answers["level"].score))
+    stub = StubClient(scenario="score_decimal", surface="chat_completions", winner=1)
+    try:
+        SystemOneClient(
+            stub, model="stub-model", method="discrete", api="chat_completions",
+            n_retry_malformed=0,
+        ).system_one(state=state, questions={"level": score_question})
+    except MalformedAnswerError as exc:
+        check("score_decimal: a decimal fraction is not rounded to an integer level",
+              "2.0000000000000000000001" in str(exc), str(exc))
+    else:  # pragma: no cover
+        check("score_decimal: a decimal fraction is not rounded to an integer level", False, "no error")
+
+    stub = StubClient(scenario="unicode_label", surface="chat_completions")
+    try:
+        SystemOneClient(
+            stub, model="stub-model", method="discrete", api="chat_completions",
+            n_retry_malformed=0,
+        ).system_one(
+            state=state,
+            questions={"letter": Choice(criteria={"a": "ASCII option", "b": "other"})},
+        )
+    except MalformedAnswerError as exc:
+        check("unicode_label: a dotless-i lookalike is not folded into the ASCII label set",
+              "label" in str(exc) and "ı" in str(exc), str(exc))
+    else:  # pragma: no cover
+        check("unicode_label: a dotless-i lookalike is not folded into the ASCII label set", False, "no error")
+    stub = StubClient(scenario="unicode_label", surface="chat_completions")
+    response = SystemOneClient(
+        stub, model="stub-model", method="discrete", api="chat_completions"
+    ).system_one(state=state, questions={"letter": Choice(criteria={"a": "ASCII option"})})
+    check("unicode_label: ASCII folding still resolves an uppercase label to its option key",
+          response.answers["letter"].choice == "a", repr(response.answers["letter"].choice))
+
+    secret = BEARER_SECRET
+    stub = StubClient(scenario="redacted_header", surface="responses")
+    client = SystemOneClient(
+        stub, model="stub-model", method="logprobs", api="responses",
+        extra_headers={"Authorization": f"Bearer {secret}"},
+    )
+    client.system_one(state=state, questions={"intent": question()})
+    recorded = (stub.requests[0].get("extra_headers") or {}).get("Authorization")
+    check("redacted_header: the recorded request keeps the credential header name but not its value",
+          recorded == "<redacted>", repr(recorded))
+    try:
+        client.system_one(state=state, questions={"intent": question()})
+    except ProviderError as exc:
+        check("redacted_header: a provider error quoting the credential is scrubbed",
+              "<redacted>" in str(exc) and secret not in str(exc), str(exc))
+    else:  # pragma: no cover
+        check("redacted_header: a provider error quoting the credential is scrubbed", False, "no error")
 
     # The live probe's own reporting, exercised offline: what a model advertises, and how a failure reads.
     advertised = _capabilities({"reasoning", "max_tokens", "structured_outputs", "logprobs"})
