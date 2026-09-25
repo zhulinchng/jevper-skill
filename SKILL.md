@@ -13,7 +13,7 @@ with probabilities and a `confidence`, `Noul` with its single probability. The c
 work the same way, and the state is rendered last so a rubric's prompts share a cacheable prefix. `openai`
 and `anthropic` are not runtime dependencies; `pydantic>=2.7` is. Python 3.10+.
 
-Written against jevper 0.7.3; if you are on a newer release, check its `docs/` — the library is the
+Written against jevper 0.7.4; if you are on a newer release, check its `docs/` — the library is the
 authority.
 
 ## Quick start
@@ -294,7 +294,9 @@ Three traps worth knowing:
   model spending the whole output budget thinking — is `IncompleteAnswerError`, naming the stop reason
   (`finish_reason: 'length'` / `incomplete_details.reason: 'max_output_tokens'` /
   `stop_reason: 'max_tokens'`) and suggesting the cap *that surface* uses (`max_output_tokens` on
-  Responses, `max_tokens` on Chat and Messages); nobody sends those caps, so raise it and turn thinking off.
+  Responses, `max_completion_tokens` on Chat — which is what OpenAI's route takes, with `max_tokens`
+  named beside it for local servers — and `max_tokens` on Messages); nobody sends those caps, so raise it
+  and turn thinking off.
   A context window too small is terminal the same way but wants the opposite remedy, so that message says
   to shorten the state or the examples. A refusal is `ModelRefusalError` — a `refusal` beside a null
   `content`, a `refusal` content part, `stop_reason: 'refusal'`, or a safety `content_filter` — with the
@@ -320,7 +322,7 @@ move (also under a pinned `method="logprobs"`), the server-limits ladder and the
 absorb, the schema in `output_config` and in the prompt, the quoted untrusted state, the retry rules, the
 event-stream reader on all three surfaces, and the provider shapes that used to read as an answer. Its
 `surface=` knob picks which endpoints the fake client exposes: `chat_completions`, `responses`, `messages`
-(the Anthropic shape) or `both`. It needs jevper 0.7.3 or newer.
+(the Anthropic shape) or `both`. It needs jevper 0.7.4 or newer.
 
 ```python
 import sys
@@ -371,5 +373,6 @@ matrix and what each quota means.
 - [references/troubleshooting.md](references/troubleshooting.md) — error triage, debug keys, symptom → fix.
 
 Inside the jevper repo, `docs/` holds the full reference (`index.md`, `getting-started.md`, `api.md`,
-`methods.md`, `reasoning.md`, `few-shot.md`, `local-servers.md`, `internals.md`, `mlflow.md`) and `tests/`
+`methods.md`, `reasoning.md`, `few-shot.md`, `local-servers.md`, `architecture.md`, `internals.md`,
+`troubleshooting.md`, `complete-example.md`, `glossary.md`, `mlflow.md`) and `tests/`
 drives a real `openai` client against a stub HTTP server.

@@ -74,7 +74,7 @@ Scenarios:
     unicode_label          a discrete choice where ASCII folding must not absorb a Unicode lookalike
     redacted_header        a credential header kept by name but removed from recorded values and errors
 
-It needs jevper 0.7.3 or newer. The self-test also exercises construction-path refusals, example
+It needs jevper 0.7.4 or newer. The self-test also exercises construction-path refusals, example
 validation and a state too deep for this interpreter's JSON encoder.
 
 Knobs: ``surface`` (``chat_completions``, ``responses``, ``messages`` or ``both``, default ``both`` — the
@@ -1300,7 +1300,12 @@ def _run_checks() -> int:
     except IncompleteAnswerError as exc:
         check("truncated: the Chat finish_reason names the same spent budget",
               "ran out of output tokens" in str(exc) and "'length'" in str(exc)
-              and "extra_body={'max_tokens': 2048}" in str(exc) and len(stub.requests) == 1, str(exc))
+              # 0.7.4: OpenAI's Chat route now takes max_completion_tokens and refuses max_tokens on
+              # reasoning models, so the remedy names that first and offers max_tokens as the
+              # local-server alternative. Pinning both halves catches a regression to the old,
+              # unfollowable advice.
+              and "extra_body={'max_completion_tokens': 2048}" in str(exc)
+              and "'max_tokens'" in str(exc) and len(stub.requests) == 1, str(exc))
     except JevperError as exc:  # pragma: no cover - the wrong error type
         check("truncated: the Chat finish_reason names the same spent budget", False, repr(exc))
     else:  # pragma: no cover
