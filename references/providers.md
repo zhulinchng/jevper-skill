@@ -105,7 +105,11 @@ reasoning parts (`summary_text`, `reasoning_text`, `text`), an own `status` per 
 `phase`-labelled message (`commentary` then `final_answer`, only the last read), and logprob tokens carried
 as raw `bytes` for a byte-level tokenizer. What costs a call: an item still `in_progress` under a
 `completed` response is a `ProviderError` (not an empty answer), and a non-streaming request answered with
-an event stream is a named `ProviderError` rather than a parse crash.
+an event stream is a named `ProviderError` rather than a parse crash. Measured, a chat stream from all
+five is a run of `data:`-only OpenAI chunks with no `event:` line at all (ollama and LM Studio close it with
+`data: [DONE]`), so that is the mismatch case rather than a failure frame: nothing in it names a failure,
+and the fix is a server that answers a whole response when asked for one. The `event: error` dialect is
+OpenResponses' own, and only a provider that actually fails mid-stream produces it.
 
 Where a request cannot be *relied on* to state the answer's shape, the JSON Schema also travels in the
 system prompt: always on the Messages surface, and on the OpenAI surfaces when `structured_outputs=False` or
@@ -195,10 +199,19 @@ message, and 512 left room for the answer.) The ollama row above is the Chat for
 **What the 0.7.1 sweep added**, 18 scenarios per server on the same card and models:
 
 - **`"stream": 0` in the request body is a caller error on three of the five**, in three different words:
-  llama.cpp `400 Field 'stream': type must be boolean, but is number`, ollama `400 invalid stream value:
-  json: cannot unmarshal number into Go value of type bool`, LM Studio `400 Expected boolean, received
-  number`. vLLM accepts it (its model coerces `0` to `false`) and SGLang does not object either. jevper
-  refuses a *truthy* `stream` itself, so these are yours: omit the field or send `false`.
+  llama.cpp `400 Field 'stream': type must be boolean, but is number` and ollama `400 invalid stream value:
+  json: cannot unmarshal number into Go value of type bool`, both on Chat Completions *and* Responses;
+  LM Studio refuses it on its Responses route (`400 Expected boolean, received number`) and accepts it on Chat
+  Completions. vLLM and SGLang accept it everywhere (vLLM's model coerces `0` to `false`). jevper refuses a
+  *truthy* `stream` itself, so these are yours: omit the field or send `false`.
+- **The Anthropic route is validated least of all.** LM Studio's `/v1/messages` accepts `output_config`
+  with a strict `json_schema` (`200`) and also accepts an unknown `format.type` (`200`) — it reads the
+  answer rather than the schema, so a `structured` call there works and a constrained one cannot be
+  trusted to constrain. An unknown model id is `200` on that route too.
+- **A `404` may carry a code that is not a model code.** vLLM answers a bad model id with
+  `{"code": "404", …}` — the status as a string — so jevper's model-error codes (`model_not_found` and
+  friends) do not match it and the *message* naming the model is what identifies it. That is the common
+  case: the codes exist for the providers that fill in nothing else.
 - **A 26-option question is where a 4B model shows.** On SGLang the label readout answered and reported all
   26 probabilities; on vLLM and LM Studio the model answered in prose whose first token was `no`, and jevper
   raised `LabelReadoutError` after its corrective retry. `method="structured"` returns all 26 keys
