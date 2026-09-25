@@ -159,8 +159,8 @@ models, with thinking off — the eight questions jevper's own Responses request
 
 | | ollama 0.34.3 | llama.cpp | LM Studio | vLLM 0.30.1 | SGLang 0.5.20 |
 | --- | --- | --- | --- | --- | --- |
-| typed items, content a string | 200 | 200 | 200 | 200 | 200 |
-| the same with `input_text` parts | 200 | 200 | 200 | 200 | 200 |
+| typed items, content a string | 200, answered at a larger budget | 200, answered | 200, answered | 200, answered | 200, answered |
+| the same with `input_text` parts | 200, answered at a larger budget | 200, answered | 200, answered | 200, answered | 200, answered |
 | `include` + `top_logprobs: 5` | `logprobs: []` | `400 top_logprobs requires logprobs to be set to true` | real logprobs on the part, **with `bytes`** | real logprobs with `bytes` | real logprobs with `bytes` |
 | strict `text.format` with a `const` | 200, ignored | 200, ignored | 200, ignored — the model invents its own shape | **enforced**: the const came back | **enforced** |
 | a nonsense `format.type` | 200 | 200 | 200 | **400** | **400** |
@@ -175,10 +175,11 @@ there, while vLLM and SGLang answer it with the constant the prompt never mentio
 they do not know. And a **`404` is not the same on every surface**: ollama, vLLM and SGLang name the model
 on `/v1/responses` (so `auto` reports the model rather than moving), while llama.cpp and LM Studio answer
 `200` for an id they do not have — and SGLang's *Chat* route answers `200` too, substituting a model, while
-its Responses route `404`s. `top_logprobs: 20` — the client's default — was measured returning **twenty**
-alternatives for the answer token (ollama and SGLang, directly; the library's sweep has the other three),
-and `n: 2` is *not* portable: vLLM and SGLang return two choices, ollama and LM Studio accept the field and
-answer once, and llama.cpp refuses it when it serves one slot (`400 n must be between 1 <= value <= 1`).
+its Responses route `404`s. `top_logprobs: 20` — the client's default — returns **twenty** alternatives
+for the answer token on ollama, llama.cpp and SGLang (measured here), and the library's own sweep has vLLM
+and LM Studio; `n: 2` is *not* portable: vLLM and SGLang return two choices, ollama and LM Studio accept
+the field and answer once, and llama.cpp refuses it when it serves one slot
+(`400 Field 'n': Value must be between 1 <= value <= 1, but got 2`).
 One more ollama-specific trap, measured: the thinking-off knob reaches its Chat route but **not** its
 Responses route. The same request with `max_output_tokens: 96` came back `completed` with a reasoning item
 and an **empty** message, and 512 tokens left room for the answer — so on that route a small budget looks
