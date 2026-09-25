@@ -10,7 +10,7 @@ npx skills add zhulinchng/jevper-skill
 
 Single-skill repo: root `SKILL.md` with valid `name` + `description` frontmatter, so the installer picks it up directly (`--list` shows it without installing; `-a '*'` installs to every detected agent).
 
-Written and verified against **jevper 0.7.2** (Python 3.10+, `pydantic>=2.7`). Every behaviour it describes — methods, fallbacks, the server-limits ladder, prompt caching, the three surfaces, error messages — was checked against that release, on five local servers; if you are on a newer one, its `docs/` is the authority.
+Written and verified against **jevper 0.7.3** (Python 3.10+, `pydantic>=2.7`). Every behaviour it describes — methods, fallbacks, the server-limits ladder, prompt caching, the three surfaces, error messages — was checked against that release, on five local servers; if you are on a newer one, its `docs/` is the authority.
 
 ## What it covers
 
@@ -41,7 +41,7 @@ Written and verified against **jevper 0.7.2** (Python 3.10+, `pydantic>=2.7`). E
 ## Verify
 
 ```bash
-pip install jevper                                 # Python 3.10+, pydantic>=2.7; 0.7.2 or newer
+pip install jevper                                 # Python 3.10+, pydantic>=2.7; 0.7.3 or newer
 python scripts/offline_stub.py --check             # offline self-test: no network, no API key
 python scripts/offline_stub.py --live --model <id> # needs openai + OPENAI_API_KEY; OPENAI_BASE_URL for self-hosted
                                          # reports the advertised parameters first (free, no quota), then makes one system_one call
@@ -61,4 +61,4 @@ The self-test drives `StubClient` through the real jevper readout path: the logp
 
 The library is at [zhulinchng/jevper](https://github.com/zhulinchng/jevper) (Apache-2.0), where `docs/` holds the full reference — [`api.md`](https://github.com/zhulinchng/jevper/blob/main/docs/api.md), [`methods.md`](https://github.com/zhulinchng/jevper/blob/main/docs/methods.md), [`reasoning.md`](https://github.com/zhulinchng/jevper/blob/main/docs/reasoning.md), [`few-shot.md`](https://github.com/zhulinchng/jevper/blob/main/docs/few-shot.md), [`local-servers.md`](https://github.com/zhulinchng/jevper/blob/main/docs/local-servers.md), [`internals.md`](https://github.com/zhulinchng/jevper/blob/main/docs/internals.md), [`mlflow.md`](https://github.com/zhulinchng/jevper/blob/main/docs/mlflow.md).
 
-`jevper` is an independent implementation of the documented System One wire format, not affiliated with, endorsed by, or supported by [TypeSafe AI](https://docs.typesafe.ai); questions about the hosted API itself belong in their docs. The reference jevper 0.7.2 matches behaviour-for-behaviour is TypeSafe's own LLM-backed drop-in, [`system-one-adapter`](https://pypi.org/project/system-one-adapter/)
+`jevper` is an independent implementation of the documented System One wire format, not affiliated with, endorsed by, or supported by [TypeSafe AI](https://docs.typesafe.ai); questions about the hosted API itself belong in their docs. The reference jevper 0.7.3 matches behaviour-for-behaviour is TypeSafe's own LLM-backed drop-in, [`system-one-adapter`](https://pypi.org/project/system-one-adapter/)

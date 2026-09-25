@@ -74,7 +74,8 @@ Scenarios:
     unicode_label          a discrete choice where ASCII folding must not absorb a Unicode lookalike
     redacted_header        a credential header kept by name but removed from recorded values and errors
 
-It needs jevper 0.7.2 or newer.
+It needs jevper 0.7.3 or newer. The self-test also exercises construction-path refusals, example
+validation and a state too deep for this interpreter's JSON encoder.
 
 Knobs: ``surface`` (``chat_completions``, ``responses``, ``messages`` or ``both``, default ``both`` — the
 endpoints this client exposes, as ``openai.OpenAI`` exposes the first two and ``anthropic.Anthropic`` the
@@ -163,6 +164,18 @@ SCHEMA_MARKER = "JSON Schema:\n"  # jevper puts the schema in the prompt when th
 PROMPT_TOKENS = 2388  # the measured prompt in jevper's docs/local-servers.md
 COMPLETION_TOKENS = 8
 CACHED_TOKENS = 1010  # llama.cpp's reuse for a state-varied second call on that prompt
+
+
+def _nested(depth: int) -> list[Any]:
+    root: list[Any] = []
+    cursor = root
+    for _ in range(depth):
+        child: list[Any] = []
+        cursor.append(child)
+        cursor = child
+    return root
+
+
 BEARER_SECRET = "$" * 2 + "BEARERTOKEN_YVZEFVAZ8UA9:L" + "$" * 2
 
 
@@ -702,9 +715,12 @@ class StubClient:
 
 
 def _run_checks() -> int:
+    import jevper
     from jevper import (
         Choice,
+        Example,
         IncompleteAnswerError,
+        InvalidQuestionError,
         JevperError,
         LabelReadoutError,
         MalformedAnswerError,
@@ -718,7 +734,7 @@ def _run_checks() -> int:
         UnsupportedMethodError,
         reasoning_text,
     )
-
+    from pydantic import ValidationError
     failures = 0
 
     def check(name: str, ok: bool, detail: str = "") -> None:
@@ -885,6 +901,111 @@ def _run_checks() -> int:
     check("validation: a blank model is refused at construction and as a per-call override",
           blank and override and not stub.requests,
           f"blank={blank} override={override} requests={len(stub.requests)}")
+
+    # A question built in Python and one handed over as data have one local error family, while
+    # ReasoningConfig remains the pydantic model it is.
+    try:
+        Choice(criteria={"a": "x", "b": "y"}, weight=1)
+    except InvalidQuestionError as exc:
+        built = str(exc)
+    else:  # pragma: no cover
+        built = ""
+    check("construction: a question built in Python fails as InvalidQuestionError, not pydantic's",
+          "weight" in built and "Extra inputs are not permitted" in built
+          and issubclass(InvalidQuestionError, JevperError)
+          and "InvalidQuestionError" in jevper.__all__, built)
+
+    stub = StubClient()
+    try:
+        SystemOneClient(stub, model="stub-model").system_one(
+            state=state,
+            questions={"intent": {"type": "choice", "criteria": {"a": "x", "b": "y"}, "bogus": 1}},
+        )
+    except InvalidQuestionError as exc:
+        mapped = str(exc)
+    else:  # pragma: no cover
+        mapped = ""
+    check("construction: the same question handed over as data names the question it came from",
+          "question 'intent' is invalid" in mapped and "bogus" in mapped and not stub.requests, mapped)
+
+    range_messages: list[str] = []
+    try:
+        Choice(criteria={})
+    except InvalidQuestionError as exc:
+        range_messages.append(str(exc))
+    try:
+        Score(criteria=["only"])
+    except InvalidQuestionError as exc:
+        range_messages.append(str(exc))
+    check("construction: an out-of-range question is refused where it is built",
+          len(range_messages) == 2
+          and "choice needs 1..255 options" in range_messages[0] and "got 0" in range_messages[0]
+          and "score needs 2..10 levels" in range_messages[1] and "got 1" in range_messages[1],
+          " | ".join(range_messages))
+
+    try:
+        ReasoningConfig(effort="nope")
+    except ValidationError as exc:
+        reasoning_error = str(exc)
+    else:  # pragma: no cover
+        reasoning_error = ""
+    check("construction: ReasoningConfig is still pydantic's own error", bool(reasoning_error), reasoning_error)
+
+    # Examples are checked where their question is built; the question is what supplies the option keys.
+    try:
+        Choice(
+            criteria={"a": "x", "b": "y"},
+            examples=[Example(state="s", answer="nope")],
+        )
+    except InvalidQuestionError as exc:
+        answer_error = str(exc)
+    else:  # pragma: no cover
+        answer_error = ""
+    check("examples at construction: an answer that matches no option is refused by the question that carries it",
+          "choice question: example 0" in answer_error and "does not match any option" in answer_error,
+          answer_error)
+
+    try:
+        Choice(
+            criteria={"a": "x", "b": "y"},
+            examples=[Example(state="s", answer="a", probabilities={"a": 0.5, "c": 0.5})],
+        )
+    except InvalidQuestionError as exc:
+        keys_error = str(exc)
+    else:  # pragma: no cover
+        keys_error = ""
+    check("examples at construction: probabilities must carry exactly the question's keys",
+          "exactly the keys" in keys_error and "['a', 'b']" in keys_error and "['a', 'c']" in keys_error,
+          keys_error)
+
+    stub = StubClient()
+    try:
+        Choice(
+            criteria={"a": "x", "b": "y"},
+            examples=[Example(state="s", answer="a", probabilities={"a": -0.2, "b": 1.2})],
+        )
+    except InvalidQuestionError as exc:
+        negative_error = str(exc)
+    else:  # pragma: no cover
+        negative_error = ""
+    check("examples at construction: a negative probability is refused before any request",
+          "must be >= 0" in negative_error and not stub.requests, negative_error)
+
+    bare_negative_ok = False
+    try:
+        Example(state="s", answer=True, probabilities={True: -0.1, False: 0.5})
+    except InvalidQuestionError:
+        pass
+    else:  # pragma: no cover
+        bare_negative_ok = True
+    try:
+        Example(state="s", answer=True, probabilities={True: float("nan"), False: 0.5})
+    except InvalidQuestionError as exc:
+        bare_nan_error = str(exc)
+    else:  # pragma: no cover
+        bare_nan_error = ""
+    check("examples at construction: a bare Example is only checked for what it can see alone",
+          bare_negative_ok and "probabilities" in bare_nan_error, bare_nan_error)
 
     # A provider that rejects the logprob fields on both surfaces: auto falls back, and remembers.
     stub = StubClient(scenario="reject_logprobs")
@@ -1958,6 +2079,24 @@ def _run_checks() -> int:
         check("deep_json: over-deep JSON is a MalformedAnswerError, not a RecursionError", False, repr(exc))
     else:  # pragma: no cover
         check("deep_json: over-deep JSON is a MalformedAnswerError, not a RecursionError", False, "no error")
+
+    # A million levels, because that is what this interpreter's encoder needs before it gives up:
+    # a hundred thousand still encodes on 3.14, and the depth that trips it is a property of the
+    # runtime — which is the point the error message makes. On an older CPython fewer levels do.
+    stub = StubClient()
+    try:
+        SystemOneClient(stub, model="stub-model", method="structured", api="chat_completions").system_one(
+            state=_nested(1_000_000), questions={"intent": question()}
+        )
+    except JevperError as exc:
+        check("deep_state: a state too deep for this interpreter's JSON encoder is a JevperError, not a RecursionError",
+              "nested too deeply" in str(exc) and not stub.requests, str(exc))
+    except RecursionError as exc:  # pragma: no cover - the regression this check exists to catch
+        check("deep_state: a state too deep for this interpreter's JSON encoder is a JevperError, not a RecursionError",
+              False, repr(exc))
+    else:  # pragma: no cover
+        check("deep_state: a state too deep for this interpreter's JSON encoder is a JevperError, not a RecursionError",
+              False, "no error")
 
     score_question = Score(instructions="How bad is it?", criteria=["a", "b", "c"])
     stub = StubClient(scenario="score_decimal", surface="chat_completions")

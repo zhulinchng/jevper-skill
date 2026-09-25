@@ -79,14 +79,19 @@ Three levels, first non-empty wins, no merging:
 
 A bare sequence applies to every question in the call; a mapping is keyed by question id. Every question's
 examples are resolved and validated before the first request — a call that is locally invalid spends
-nothing, rather than failing inside one worker after the questions ahead of it have already paid. The
-container must be a sequence of `Example` objects, and anything else is `InvalidQuestionError` naming the
-index rather than an `AttributeError` later. An answer that matches no option raises `InvalidQuestionError`,
+nothing, rather than failing inside one worker after the questions ahead of it have already paid. An
+example carried *by its own question* (`Choice(examples=[...])`) is checked there instead, at construction,
+because the question that gives the answer its meaning is right there; the message is prefixed
+`choice question:` rather than a question id. The container must be a sequence of `Example` objects, and
+anything else is `InvalidQuestionError` naming the index rather than an `AttributeError` later. An answer
+that matches no option raises `InvalidQuestionError`,
 and a `Noul` example's `probabilities` must key each answer one way only (`True`/`False`, not
 `{True: 0.2, "true": 0.8}`, which is two spellings of one answer after JSON round-trips). `probabilities` is
 only read by `structured` and defaults to one-hot over `answer` — a one-hot example teaches the model that
 answers are certain, so pass explicit numbers when the demonstration should teach calibration. Wrong key
-sets or negative values are refused (`InvalidQuestionError` naming the example index).
+sets or negative values are refused (`InvalidQuestionError` naming the example index). A bare `Example` has
+no question to be checked against, so it is checked only for what pydantic can see on its own — a
+non-finite probability, an extra field — and the rest when it is handed to a question or a call.
 
 ## Async
 
@@ -317,6 +322,10 @@ Constructor misuse (unknown `method`/`api`, a count option that is not an intege
 over-long `prompt_cache_key`, a `model` that is not a non-blank string, a header name or value the HTTP layer
 could not carry) raises `JevperError` immediately, so a typo never reaches a provider — and so does a
 per-call `api=""`/`method=""` or `model=""`,
-since an override is only used when it is not `None`. `ReasoningConfig` is a pydantic model, so its
-own validation (`effort`, `budget_tokens`, `mode`) raises `pydantic.ValidationError` at the point you build
-it, not from the client; `budget_tokens` stays validated if you assign to it afterwards.
+since an override is only used when it is not `None`. A question type is checked *twice* — where it is built
+and again in `system_one` — and both paths raise `InvalidQuestionError` (a `JevperError`), naming the field
+that was wrong: `Choice: weight: Extra inputs are not permitted`, or with an id,
+`question 'intent' is invalid: Choice: bogus: Extra inputs are not permitted`. `ReasoningConfig` is a plain
+pydantic model and not one of those, so its own validation (`effort`, `budget_tokens`, `mode`) still raises
+`pydantic.ValidationError` at the point you build it, not from the client; `budget_tokens` stays validated if
+you assign to it afterwards.

@@ -13,7 +13,7 @@ with probabilities and a `confidence`, `Noul` with its single probability. The c
 work the same way, and the state is rendered last so a rubric's prompts share a cacheable prefix. `openai`
 and `anthropic` are not runtime dependencies; `pydantic>=2.7` is. Python 3.10+.
 
-Written against jevper 0.7.2; if you are on a newer release, check its `docs/` — the library is the
+Written against jevper 0.7.3; if you are on a newer release, check its `docs/` — the library is the
 authority.
 
 ## Quick start
@@ -60,8 +60,10 @@ in one user turn; a list of dicts is read as chat turns, a list of anything else
 
 - Criteria descriptions are prompts, not labels: write what belongs in each option. They are rendered
   verbatim, and the model picks between them.
-- Unknown fields are rejected (`extra="forbid"`); raw mappings (`{"type": "choice", "criteria": {...}}`)
-  are parsed and validated exactly like the classes.
+- Unknown fields are rejected (`extra="forbid"`), and a question is checked where it is built *and* again in
+  `system_one`: raw mappings (`{"type": "choice", "criteria": {...}}`) are parsed with a discriminated union and
+  refused the same way, with the question id in the message. Both paths raise `InvalidQuestionError`, not
+  pydantic's `ValidationError`.
 - `Score.score` is the probability-weighted level index `Σ i·pᵢ` over zero-based levels, read off the
   distribution rescaled to 1 — so it stays on the 0..N-1 line even with `normalize_probabilities=False`,
   where the reported probabilities are the model's own — and `legend` maps level index to your description.
@@ -211,7 +213,7 @@ Four groups, and only the two middle ones are worth catching for control flow:
 
 | Error | Raised when | What to do |
 | --- | --- | --- |
-| `InvalidQuestionError`, `UnsupportedMethodError`, `ClientCapabilityError` | before any request: bad question or example (every example is checked up front, before the first call), `grammar` on the wrong surface or `logprobs`/`grammar` on the Messages surface, a client missing the attribute a surface needs, or an `extra_headers` name that is not an HTTP token or a value that is not printable ASCII (a CRLF, NUL, non-ASCII or lone surrogate is refused here, not sent) — plus, after one, a JSON body carrying no usable first choice and no explanation of why. An event *stream* is not in this row any more: it is `ProviderError` on all three surfaces | fix the code; the first three cost nothing, and the last is never retried |
+| `InvalidQuestionError`, `UnsupportedMethodError`, `ClientCapabilityError` | before any request: a question or example that is invalid **wherever it is built** — `Choice(criteria={})` raises it, and so does the mapping handed to `system_one`, so one `except JevperError` covers a rubric written in Python and one loaded from data. An example's answer and its own numbers are checked against the question that carries it at construction; `examples=` passed to the client or the call have no question to check against until the call pairs them with one, so they are checked there, still before any request. Then `grammar` on the wrong surface or `logprobs`/`grammar` on the Messages surface, a client missing the attribute a surface needs, or an `extra_headers` name that is not an HTTP token or a value that is not printable ASCII (a CRLF, NUL, non-ASCII or lone surrogate is refused here, not sent) — plus, after one, a JSON body carrying no usable first choice and no explanation of why. An event *stream* is not in this row any more: it is `ProviderError` on all three surfaces | fix the code; the first three cost nothing, and the last is never retried |
 | `LabelReadoutError`, `MalformedAnswerError` | the answer came back but could not be read; a model-side failure gets one corrective retry by default (`n_retry_malformed`) with a correction turn, while a provider that does not report logprobs at all is never corrected | usually leave it alone; `auto` turns the provider-side cases into `structured` instead |
 | `IncompleteAnswerError`, `ModelRefusalError` | the provider stopped generating before the answer was complete (a spent output budget, or a context window too small) or reported that the model declined or was filtered — `refusal`, `content_filter` alike, since a second attempt is filtered the same way — both are `ProviderError` subclasses raised *before* any readout, because a cut-off, declined or withheld generation is not an answer to correct | fix the request, not the reader: turn thinking off, raise the cap the surface names (`max_output_tokens` on Responses, `max_tokens` on Chat and Messages) or shorten the state; a refusal needs a different request or model, and a retry is refused the same way |
 | `ProviderError` | a provider call failed — retried while the failure is transient, which is the set below — and `.attempts`/`.status_code` hold the history, including a status carried inside a `200` body (OpenRouter: `embedded=True`, and its answer, if any, loses to the error beside it), a Responses status that is neither `completed` nor `incomplete` or an output item still `in_progress`, and a non-streaming request answered with an event stream. In that last case the stream is read for the provider's own failure — `event: error`, OpenAI's typed `response.failed`, or a bare `{"error": …}` — and that error's status decides the retry, so a `429` inside a `200` is retried; a stream carrying no failure is a protocol mismatch whose message names the surface. It is also what you get when no surface the client can speak has the route, and that route verdict is remembered, so a client that can speak neither pays the same 404 on every call | the one to catch at a service boundary; retry it yourself only for the transient set — a missing route, a terminal generation and a stream will all fail again |
@@ -219,10 +221,16 @@ Four groups, and only the two middle ones are worth catching for control flow:
 `JevperError` is the base class — catch it if you want one handler for everything, including constructor
 misuse (a count option that is not an integer or out of range, a blank `model`, an unknown `method`/`api`, a
 header name or value the HTTP layer could not carry), a bad `state` message, content that is not
-JSON-serializable or carries a non-finite number, a string that cannot be encoded as UTF-8 in the state, the
-question, the model id or `extra_body`, and an `extra_body` that refers to itself — all named, before any
-request, rather than failing later inside the SDK or looping over the cycle. The constructor copies
-`extra_body` and `extra_headers`, so editing your dict afterwards does not change what this client sends.
+JSON-serializable or carries a non-finite number, a string that cannot be encoded as UTF-8 in the state,
+the question, the model id or `extra_body`, and an `extra_body` that refers to itself — all named, before any
+request, rather than failing later inside the SDK or looping over the cycle. A structure nested deeper than
+this interpreter's JSON encoder can write is the same story: a named `JevperError`, not a `RecursionError`
+escaping a public call, and the message says where the limit came from — it is a property of the runtime, so
+the same state can encode on one Python and not another; flatten it or hand it over as text.
+`InvalidQuestionError` is a `JevperError`, so one handler for the base covers a rubric built in Python and one
+loaded from data; `ReasoningConfig` is the one caller-facing model that is not a question type, and pydantic's
+own `ValidationError` is still what it raises. The constructor
+copies `extra_body` and `extra_headers`, so editing your dict afterwards does not change what this client sends.
 
 Transient failures are retried per call with `RetryPolicy(n_retries=2, base_delay=0.5, max_delay=8.0)`, at
 `min(base_delay · 3ⁿ, max_delay)`: the statuses `408`, `409`, `429` and *any* `5xx`, plus connection and
@@ -305,7 +313,7 @@ move (also under a pinned `method="logprobs"`), the server-limits ladder and the
 absorb, the schema in `output_config` and in the prompt, the quoted untrusted state, the retry rules, the
 event-stream reader on all three surfaces, and the provider shapes that used to read as an answer. Its
 `surface=` knob picks which endpoints the fake client exposes: `chat_completions`, `responses`, `messages`
-(the Anthropic shape) or `both`. It needs jevper 0.7.2 or newer.
+(the Anthropic shape) or `both`. It needs jevper 0.7.3 or newer.
 
 ```python
 import sys

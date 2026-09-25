@@ -117,7 +117,11 @@ the server refused the strict schema. A server can accept a schema field and dro
 the Messages route jevper sends Anthropic's own `output_config.format` *and* keeps the schema in the prompt —
 the prompt is the only place the shape is stated on a server that silently ignores the field. Where the
 request no longer states it, the answer's shape is only as good as the model's instruction-following: expect
-more `MalformedAnswerError`s, set `temperature=0.0`, and keep the criteria descriptions unambiguous.
+more `MalformedAnswerError`s, set `temperature=0.0`, and keep the criteria descriptions unambiguous. The
+exact-root-key check names precisely that failure, twice measured on the two servers that ignore the field:
+llama.cpp's Responses route answered a `noul` question with `{"isAboutMoney": …, "noul": …}` — the error reads
+`the structured answer must be an object with exactly 'noul', got keys ['isAboutMoney', 'noul']` — and LM
+Studio's answered `'noul'` with the string `'A'`. The key names, not the values, are what reach the message.
 
 A client object cannot say whether the *server* implements a route — `openai.OpenAI` exposes
 `responses.create` either way — so `auto` reads the responses:
@@ -186,8 +190,12 @@ they do not know. And a **`404` is not the same on every surface**: ollama, vLLM
 on `/v1/responses` (so `auto` reports the model rather than moving), while llama.cpp and LM Studio answer
 `200` for an id they do not have — and SGLang's *Chat* route answers `200` too, substituting a model, while
 its Responses route `404`s. `top_logprobs: 20` — the client's default — returns **twenty** alternatives
-for the answer token on ollama, llama.cpp and SGLang (measured here), and the library's own sweep has vLLM
-and LM Studio; `n: 2` is *not* portable: vLLM and SGLang return two choices, ollama and LM Studio accept
+for the answer token on all five (measured on ollama, llama.cpp, vLLM and SGLang by the library's own sweep,
+on LM Studio here). A *smaller* value can leave the labels out of the list altogether: ollama asked for 5
+on a five-option question and returned five alternatives, none of them a label, which jevper reports as
+"none of which was an alternative among the options" rather than reading a label out of a token that is not
+one — the default is 20 for exactly this reason. `n: 2` is *not* portable: vLLM and SGLang return two
+choices, ollama and LM Studio accept
 the field and answer once, and llama.cpp refuses it when it serves one slot
 (`400 Field 'n': Value must be between 1 <= value <= 1, but got 2`).
 One ollama-specific correction, measured on the 0.7.1 sweep: `reasoning_effort` reaches its Chat route and
@@ -351,7 +359,11 @@ reasoning only, or `IncompleteAnswerError` when the trace spent the output budge
 so the knob is not silently dropped, and with it vLLM's route answers. It is not enough everywhere:
 SGLang's Messages route spends a 1024-token budget on a thinking model's trace and returns no text, so
 there use the OpenAI surfaces or `extra_body={"max_tokens": 2048}`, and check the reasoning field for the
-surface you are on (ollama's Messages route takes the same `{"reasoning_effort": "none"}` as its Chat one).
+surface you are on. ollama is the one server here whose Messages route does not take the thinking-off field
+at all: `reasoning_effort: "none"` leaves the trace running there (2368 characters of it on one measured
+call), so a thinking model spends jevper's 1024-token default before the answer begins and the call is
+`IncompleteAnswerError` naming the limit to raise. Answering there takes
+`extra_body={"max_tokens": 4096}` — the one knob that route reads.
 SGLang needs one more
 server-side decision: with `--reasoning-parser qwen3` and a
 *non-thinking* model, whose template has no `enable_thinking` to set, the parser never sees the closing
