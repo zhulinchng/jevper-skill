@@ -1,22 +1,91 @@
 ---
 name: jevper
-description: Writes and debugs Python code that calls jevper — the Jev (System One) interface that turns a state plus Noul/Choice/Score questions into typed answers with probabilities and confidence, over any OpenAI-compatible model. Use whenever the user mentions jevper, the Jev or System One API, TypeSafe-style classification, or wants an LLM to classify, label, triage or rate text with confidence scores — including choosing between the logprobs, grammar, structured and discrete methods, making it work on reasoning models, Gemini's OpenAI-compatibility endpoint or Claude (which reject logprobs), pointing an anthropic client at a local server with api="messages" or a thinking budget, fixing LabelReadoutError, MalformedAnswerError, IncompleteAnswerError or ProviderError, cutting cost with prompt caching and prompt_cache_key, wiring in llama.cpp/vLLM/Ollama/SGLang, adding few-shot examples or reasoning, and testing an integration without spending provider tokens.
+description: Writes and debugs Python code that calls jevper — OpenAI's Decisions API schema (client.decisions.create) and the Jev (System One) interface underneath, turning a state plus Noul/Choice/Score questions into typed answers with probabilities and confidence over any OpenAI-compatible model. Use whenever the user mentions jevper, the OpenAI Decisions API, the Jev or System One API, TypeSafe-style classification, or to classify, label, triage or rate text with confidence — picking between logprobs, grammar, structured and discrete, making it work on reasoning models, Gemini or Claude (which reject logprobs), pointing an anthropic client at a local server (api="messages", a thinking budget) or a Jev/Ollaya/CLM/kev decision server (api="systemone"), fixing LabelReadoutError, MalformedAnswerError, IncompleteAnswerError, ModelRefusalError or ProviderError, cutting cost with prompt caching, wiring in llama.cpp/vLLM/Ollama/SGLang, few-shot examples, and testing without spending provider tokens.
 ---
 
 # jevper
+
+Two APIs over one interface: OpenAI's **Decisions API schema** — `input`, `questions`, a documented
+response — and the Jev (System One) call underneath it that classification and rubric code has been written
+against since before the schema existed.
 
 `state` in, typed `questions` out. One call sends your text plus `Noul` (yes/no), `Choice` (one of N
 options) or `Score` (ordered level) questions and returns one answer per question — `Choice` and `Score`
 with probabilities and a `confidence`, `Noul` with its single probability. The client is duck-typed —
 `OpenAI()`, `AsyncOpenAI()`, `Anthropic()`, or anything exposing `chat.completions.create` /
-`responses.create` / `messages.create` — so hosted models and self-hosted llama.cpp/vLLM/Ollama/SGLang servers
-work the same way, and the state is rendered last so a rubric's prompts share a cacheable prefix. `openai`
-and `anthropic` are not runtime dependencies; `pydantic>=2.7` is. Python 3.10+.
+`responses.create` / `messages.create`, plus `post`/`get` for the `systemone` surface — so hosted models and
+self-hosted llama.cpp/vLLM/Ollama/SGLang servers work the same way, and the state is rendered last so a
+rubric's prompts share a cacheable prefix. `openai` and `anthropic` are not runtime dependencies;
+`pydantic>=2.7` is. Python 3.10+.
 
-Written against jevper 0.7.4; if you are on a newer release, check its `docs/` — the library is the
+Written against jevper 0.7.12; if you are on a newer release, check its `docs/` — the library is the
 authority.
 
-## Quick start
+## Decisions API
+
+`client.decisions.create(input=…, questions=[…])` takes OpenAI's documented
+[Decisions request](https://developers.openai.com/api/docs/guides/decisions) and returns its documented
+response — the `model`, the `answers` in ask order, and one `usage` — answered by the model behind whichever
+surface this client is configured with. OpenAI serves that schema on one route, `POST /v1/decisions`, in
+public beta and for `gpt-6-luna` alone; a local llama.cpp/LM Studio/ollama/vLLM/SGLang server and every
+Anthropic-compatible endpoint do not serve it at all, so those answer the same questions in the same schema
+here. Moving to the real route later is a client swap, not a rewrite.
+
+```python
+from openai import OpenAI
+from jevper import SystemOneClient
+
+client = SystemOneClient(OpenAI(), model="gpt-4o")
+
+decision = client.decisions.create(
+    input="I was charged twice for the same subscription this month.",
+    questions=[
+        {
+            "type": "choice",
+            "name": "department",
+            "instructions": "Which department should handle this complaint?",
+            "choices": [
+                {"value": "billing", "description": "Payments, invoices, and refunds."},
+                {"value": "technical", "description": "Problems using the product."},
+                {"value": "sales", "description": "Pricing, plans and upgrades."},
+            ],
+        }
+    ],
+)
+
+answer = decision.answers[0]      # ask order; name echoed (null when the question had none)
+answer.choice, answer.confidence  # "billing", 0.73 — the option's own value
+decision.usage.total_tokens       # per-question calls summed on a prompt surface; one call on api="systemone"
+decision.raw                      # the SystemOneResponse behind it — debug, reasoning, laya; never in a dump
+```
+
+- Request: `input` is a string (one quoted document turn) or a list of user messages, and `questions` holds
+  1–200 of three kinds — `predicate` (a `probability` back), `choice` (`choices` 2–255, each `value` a
+  string **or** a boolean and the two typed apart, `description` optional) and `score` (`levels` 2–10) —
+  each with an optional `name` echoed on its answer. Everything else on the call is `system_one`'s own
+  option (`model`, `method`, `api`, `examples`, `reasoning`, `temperature`, `prompt_cache_key`, `extras`,
+  `keep_alive`).
+- Answers come back in ask order: `choice` → the option's own value plus `probabilities[{value, probability}]`
+  and `confidence`; `score` → the probability-weighted level index plus each level's `value`, `label` and
+  `probability`; `predicate` → its `probability`.
+- Refused before any request: an `input_image` part (no surface here renders images), a question beyond the
+  wire's limits, two option values that would collapse onto one key (`"true"` beside `true` — jevper's keys
+  are text). `safety_identifier` has no parameter; an unknown keyword is a `TypeError`. A model refusal
+  raises `ModelRefusalError`; the wire's `refusal` answer exists in the models only so a payload from the
+  real endpoint validates.
+- Counts the provider omitted come back `null`, not `0`, and `cache_write_tokens` is always `null`. `usage`
+  on a prompt surface is summed over the per-question calls — a ten-question rubric pays ten prompts — while
+  `api="systemone"` asks them all in one request.
+- `decision.raw` is the `SystemOneResponse` (its `debug`, `reasoning`, each answer's `laya`) and is excluded
+  from every dump; a `system_one` response you already hold converts with `response.to_decision()` — names
+  are its question ids, values the option keys it was asked with, labels its own criteria text.
+- `examples` is keyed by question **name** here (Jev ids are positional), so a client built with
+  `SystemOneClient(..., examples={"department": […]})` guides a question named `department`.
+
+## The Jev interface underneath
+
+The same call without the Decisions schema is `system_one`, which returns the Jev answer shape keyed by your
+own question ids:
 
 ```python
 from openai import OpenAI
@@ -51,6 +120,9 @@ string, a chat message list, `{"messages": [...]}`, or any other JSON value (ren
 in one user turn; a list of dicts is read as chat turns, a list of anything else as content).
 
 ## Questions
+
+The Decisions schema's `predicate`/`choice`/`score` are these three under the wire's names — a `Choice`'s
+criteria are the option `description`s, a `Score`'s the `"<label>: <description>"` strings.
 
 | Question | Criteria | Answer fields |
 | --- | --- | --- |
@@ -112,15 +184,23 @@ for a distribution, not for a particular surface to produce one — and keeps it
 move it reports the provider's refusal rather than answering in JSON. A `grammar` request never moves: it is
 a Chat Completions convention no other surface can carry. `auto` also reads a 404 as "no such route" —
 unless it says the model does not exist, either by quoting the model id beside `model`/`no such`/`not
-exist` or by carrying a `code` like `model_not_found` (a body that fills in only the code is the one field
+exist or by carrying a `code` like `model_not_found` (a body that fills in only the code is the one field
 a provider reliably fills in) — and re-asks on a surface the client can
-speak, walking all three in order and skipping the ones already known to be missing; a Messages-only client
-keeps re-asking and keeps reporting the 404, with the route remembered. A 404 that arrives *inside* a `200`
+speak, walking the prompt surfaces in order and skipping the ones already known to be missing; a
+Messages-only client keeps re-asking and keeps reporting the 404, with the route remembered. The same
+verdict comes from a `400`, `404`, `405`, `415` or `422` whose message names the *protocol* or the *route*
+(`Model does not support this protocol.`, `ModelProtocolUnsupported`, `unsupported endpoint`, …) — read
+before the model markers, since such a refusal names the model too, and remembered like any other; where no
+surface is left, the `ProviderError` reports status 404 whatever the refusal's own status was. Neither
+happens with a pinned `api=`: the provider's own refusal travels back. A 404 that arrives *inside* a `200`
 body is not a route verdict at all: `ProviderError.embedded` marks a failure the provider put in the body,
 and a pinned `logprobs` never moves to Messages, which has no logprobs to carry. Cost: every question
 already in flight can pay the discovery, and a dual-surface client spends three requests on it (the other
 surface, then the method fallback) — three is the ordinary path, not a cap, since ladder re-asks and
-transient retries add more — while rejected requests are not counted in `usage.n_calls`.
+transient retries add more — while rejected requests are not counted in `usage.n_calls`. Surface selection is
+`api=`: `"auto"` is the default and `"chat_completions"`, `"responses"`, `"messages"` and `"systemone"`
+name one directly — the last two have paragraphs of their own below, and a pinned `api=` turns every
+fallback above off.
 
 `api="messages"` (an `anthropic.Anthropic` client) is the third surface and the only one with no label
 readout: no logprobs exist in that API, so `auto` answers with `structured` there without spending a call,
@@ -132,6 +212,25 @@ and jevper sends `1024` — plus your thinking budget, which this API wants stri
 `extra_body={"max_tokens": n}` overrides both. Thinking is a budget here, `ReasoningConfig(budget_tokens=n)`,
 which `mode="auto"` selects on its own; a server that does not know the field (SGLang's) has it dropped and
 the call re-asked, while one that refuses the number gets its own error back.
+
+`api="systemone"` is the fourth surface, the only one that posts the Jev wire itself: **one request carries
+every question** (`client.post(path="/systemone", body={state, model, questions}, cast_to=dict)` — an
+`OpenAI` object has it), the service's own `score`, `confidence`, `choice` and `legend` are read **as they
+arrived** rather than recomputed, and `usage` counts the one call. `auto` never selects it, so pin it; the
+base URL is the host jevper appends `/systemone` to, so passing the endpoint itself doubles the path into a
+404. Options with no field on that wire are refused by name in one error before anything is sent — `method`
+other than `auto`, `reasoning`, `examples`, `temperature`, `prompt_cache_key` — as are a noul carrying
+neither instructions nor criteria (the hosted Jev answers 400; `noul_requires_question=False` sends one
+anyway to Ollaya, CLM and kev, which read the question id instead), a number or boolean where the wire takes
+a string, object or array (a state, an instruction, a noul criterion, an option description, a score level),
+and an empty question id. `client.list_models()` reads the service's `/v1/models` in its own
+`{"models": [{name, …}]}` shape. Build the client with `native=True` (**requires `api="systemone"`**,
+refused on `auto`) to post to Ollaya's `POST /api/decide` instead and get a `NativeSystemOneResponse`:
+`routing` (which checkpoint a router chose — `model` stays the alias you asked for), `state_truncated`, the
+service's own nanosecond timings; `extras=("laya",)` adds the model's own `laya` confidence beside
+TypeSafe's, and `keep_alive` is ollama's lifecycle control — both belong to `native=True` alone and are
+refused on the TypeSafe route. The hosted Jev service, Ollaya, CLM and kev speak this wire;
+[references/providers.md](references/providers.md) has each.
 
 The `responses` surface carries two dialects at one path: OpenAI's Responses API and the
 [OpenResponses](https://www.openresponses.org) specification. LM Studio is a listed implementer and vLLM
@@ -174,7 +273,7 @@ Check what actually happened before debugging blind:
 ```python
 response.debug["method"]                                  # the call-level default: what auto starts with, or what you pinned
 response.debug["methods"]                                 # {"intent": "structured"} — what each question resolved to, auto only
-response.debug["api"]                                     # "chat_completions" | "responses" | "messages"
+response.debug["api"]                                     # "chat_completions" | "responses" | "messages" | "systemone"
 response.debug["server_limits"]                           # six flags for the final surface, absent when it refused nothing
 response.debug["apis"]                                    # {"intent": "chat_completions"} — per question, when one call used several
 response.debug["server_limits_by_api"]                    # the same six flags per surface, when one call used several
@@ -193,8 +292,8 @@ minimum cacheable prefix. One shape is the exception: a chat-list state whose ow
 assistant's, which no server reads as a question, so the question goes last there and that prefix is not
 reusable.
 
-Every Chat Completions and Responses request carries a `prompt_cache_key` (the Messages API has no such
-field): yours if you passed one (`prompt_cache_key=` on the client or the call; a non-blank string of at
+Every Chat Completions and Responses request carries a `prompt_cache_key` (the Messages API and the
+`systemone` surface have no such field): yours if you passed one (`prompt_cache_key=` on the client or the call; a non-blank string of at
 most 256 characters, else `JevperError` before any request is sent), or one derived per question from the
 model, the method, the example turns and the question block — the method belongs in it because its system
 prompt and answer shape are part of the cached prefix, so a `logprobs` request must not be routed into a
@@ -276,7 +375,7 @@ error. A capability field you named in `extra_body` is dropped with jevper's own
 `structured_outputs=False` the request already carried a plain `json_object`, so that rung is skipped. The
 ladder is finite, so a server that refuses everything still ends in `ProviderError`.
 
-Three traps worth knowing:
+Four traps worth knowing:
 
 - **One logprob is not a distribution.** A provider that reports only the sampled token gives a question with
   more than one option nothing to compare against: `auto` falls back to `structured`, a pinned `logprobs`
@@ -320,9 +419,11 @@ Three traps worth knowing:
 the real readout path runs end to end: the logprobs softmax, structured JSON, `auto`'s fallback and surface
 move (also under a pinned `method="logprobs"`), the server-limits ladder and the refusals it does not
 absorb, the schema in `output_config` and in the prompt, the quoted untrusted state, the retry rules, the
-event-stream reader on all three surfaces, and the provider shapes that used to read as an answer. Its
+event-stream reader on all three prompt surfaces, the Decisions wrapper's request mapping and answer shapes,
+the Jev wire and the refusals it answers with, and the provider shapes that used to read as an answer. Its
 `surface=` knob picks which endpoints the fake client exposes: `chat_completions`, `responses`, `messages`
-(the Anthropic shape) or `both`. It needs jevper 0.7.4 or newer.
+(the Anthropic shape), `systemone` (the Jev `post`), `both` (chat + responses, the default) or `all`. It
+needs jevper 0.7.12 or newer.
 
 ```python
 import sys
@@ -340,19 +441,21 @@ assert stub.requests[0]["logprobs"] is True                  # and it did ask fo
 
 Scenarios: `logprobs`, `structured`, `reject_logprobs`, `reject_include`, `no_alternatives`,
 `no_responses_route`, `no_messages_route`, `reject_schema`, `reject_format`, `reject_cache_key`,
-`reject_thinking`, `reject_budget_value`, `reject_output_config`, `truncated`, `truncated_context`,
-`failed_response`, `embedded_error`, `content_filter`, `item_in_progress`, `refusal`, `positive_logprob`,
+`reject_thinking`, `reject_budget_value`, `truncated`, `truncated_context`,
+`failed_response`, `embedded_error`, `content_filter`, `item_in_progress`, `refusal`,
+`reject_output_config`, `positive_logprob`,
 `no_rival_alternative`, `contradicts_text`, `two_objects`, `transient`, `reject_reasoning_include`,
 `reasoning`, `reasoning_only`, `stream_error`, `stream_error_chat`, `stream_split_data`, `stream_mismatch`,
 `response_failed`, `model_not_found`, `header_crlf`, `self_referential_body`, `extra_root_key`,
-`deep_json`, `score_decimal`, `unicode_label`, `redacted_header`. Run `python scripts/offline_stub.py
+`deep_json`, `score_decimal`, `unicode_label`, `redacted_header`, `reject_protocol`, `systemone`,
+`systemone_bad_routing`. Run `python scripts/offline_stub.py
 --check` from the skill directory for a self-test, and
 `python scripts/offline_stub.py --live --model <id>` (add `--api messages` for an Anthropic-compatible
-server, `--extra-body '{"chat_template_kwargs": {"enable_thinking": false}}'` for a local server whose
+server, `--api systemone` for a Jev-wire endpoint, `--extra-body '{"chat_template_kwargs": {"enable_thinking": false}}'` for a local server whose
 template thinks) with real credentials to see which method that provider actually resolves to, on which
 surface, before writing a line of your own. The live probe asks the server what the model advertises first —
-free, outside any request quota — and a `429`, `402` or `401` is reported as the account answer it is, not as
-a jevper failure.
+free, outside any request quota, and skipped on `--api systemone`, where there is no such route — and a
+`429`, `402` or `401` is reported as the account answer it is, not as a jevper failure.
 [references/providers.md](references/providers.md#does-this-provider-do-logprobs) has the
 matrix and what each quota means.
 
@@ -361,6 +464,10 @@ matrix and what each quota means.
 - [ ] Criteria written as descriptions of what belongs in each option, keys as stable identifiers.
 - [ ] `method` left unset unless there is a stated reason to pin it.
 - [ ] Answers read through the typed views (`response.answers[...]`, `.choices`, `.model_dump_json()`).
+- [ ] For the Decisions schema: `decision.answers` read in ask order, `ModelRefusalError` caught, and
+      `usage` expected to be summed per question on a prompt surface.
+- [ ] For `api="systemone"`: `base_url` is the host (jevper appends `/systemone`), the surface pinned (never
+      `auto`), and options the wire has no field for left off.
 - [ ] `JevperError` (or `ProviderError`) caught at the boundary the caller actually cares about.
 - [ ] Verified against the stub before spending provider tokens.
 - [ ] After the first live call: `debug["methods"]`, `debug["server_limits"]`, `usage.n_calls` and
@@ -368,11 +475,11 @@ matrix and what each quota means.
 
 ## More
 
-- [references/features.md](references/features.md) — reasoning, few-shot examples, async, surfaces, knobs.
-- [references/providers.md](references/providers.md) — logprob matrix, the Messages route, local servers, cache reporting.
+- [references/features.md](references/features.md) — reasoning, few-shot examples, async, surfaces, the Decisions wrapper, knobs.
+- [references/providers.md](references/providers.md) — logprob matrix, the Messages route, local and decision servers, cache reporting.
 - [references/troubleshooting.md](references/troubleshooting.md) — error triage, debug keys, symptom → fix.
 
 Inside the jevper repo, `docs/` holds the full reference (`index.md`, `getting-started.md`, `api.md`,
-`methods.md`, `reasoning.md`, `few-shot.md`, `local-servers.md`, `architecture.md`, `internals.md`,
-`troubleshooting.md`, `complete-example.md`, `glossary.md`, `mlflow.md`) and `tests/`
-drives a real `openai` client against a stub HTTP server.
+`decisions.md`, `jev-comparison.md`, `methods.md`, `reasoning.md`, `few-shot.md`, `local-servers.md`,
+`architecture.md`, `internals.md`, `troubleshooting.md`, `complete-example.md`, `glossary.md`, `mlflow.md`)
+and `tests/` drives a real `openai` client against a stub HTTP server.

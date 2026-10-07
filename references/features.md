@@ -3,7 +3,8 @@
 - [Reasoning](#reasoning) — `ReasoningConfig`, native vs two-step, reading the trace
 - [Few-shot examples](#few-shot-examples) — `Example`, the three levels, calibration
 - [Async](#async) — `AsyncSystemOneClient`
-- [Surfaces](#surfaces) — Chat Completions, Responses and Messages, and the fallbacks between them
+- [Surfaces](#surfaces) — Chat Completions, Responses, Messages and the Jev wire, and the fallbacks between them
+- [Decisions API](#decisions-api) — OpenAI's schema (`client.decisions.create`), limits, answer shapes, usage
 - [Prompt caching](#prompt-caching) — message order, `prompt_cache_key`, `usage.cached_tokens`
 - [Tracing with MLflow](#tracing-with-mlflow) — autolog spans for calls through real SDK clients, including fallbacks, and MLflow model hosting
 - [Client knobs](#client-knobs) — the options worth changing
@@ -45,7 +46,17 @@ of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; `summary` is `aut
   (`budget_tokens: must be at least 1024` on SGLang) gets its own error back, not a silent re-ask without
   thinking.
 - `summary` and `context` have no chat or Messages equivalent; they only reach the Responses surface.
-- `response.debug["reasoning_mode"]` reports `off`, `native` or `two_step`. `reasoning_text()` prefers
+- On the Messages surface, Claude 4.6 deprecated the manual `thinking` budget and 4.7 and later reject it
+  with a `400`; from 4.6 on, Anthropic's supported path is the adaptive form —
+  `extra_body={"thinking": {"type": "adaptive"}}` (optionally `display: "summarized"`) plus
+  `output_config={"effort": …}` — which jevper forwards verbatim (a caller-supplied `thinking` is
+  authoritative), while 4.5 and earlier keep the manual `budget_tokens`. On Fable 5.1, Mythos 5.1, Fable 5,
+  Mythos 5, Mythos Preview, Opus 5.5/5/4.8/4.7 and Sonnet 5, Anthropic rejects a non-default `temperature`,
+  `top_p` or `top_k` on every request, thinking or not; older models restrict those only while thinking is
+  on. The `anthropic` 1.8 SDK removed all three from `messages.create()`, so jevper sends its own
+  `temperature` through `extra_body` when it is configured and no thinking budget is sent.
+- `response.debug["reasoning_mode"]` reports `off`, `native` or `two_step`, and a call that used more than
+  one surface adds `debug["reasoning_modes"]`, one entry per question. `reasoning_text()` prefers
   provider summaries over content texts.
 - The Responses surface sends `store=false`, so the provider keeps no state: `encrypted_content` on the
   reasoning items is what makes a trace portable into a later request. On the Messages surface a thinking
@@ -123,7 +134,8 @@ failure in question order is raised.
 `api="auto"` (the default) prefers the Responses surface, which carries native reasoning and encrypted
 content — except for `grammar`, which only Chat Completions can carry, and except for a client whose only
 surface is `messages`. A client missing the attribute the chosen surface needs raises
-`ClientCapabilityError` naming the surface to pass explicitly.
+`ClientCapabilityError` naming the surface to pass explicitly. The fourth value, `api="systemone"`, is never
+chosen by `auto` — it is the Jev wire itself, not a fallback — so it is only ever pinned (see below).
 
 | | Chat Completions | Responses | Messages |
 | --- | --- | --- | --- |
@@ -168,7 +180,37 @@ Anthropic's structured outputs implement a documented subset of JSON Schema, and
 the field it bounded (`Must be at least 0.`) while the prompt keeps the full schema, where text can say what a
 constraint says. Sum-to-one stays client-side: JSON Schema cannot express it.
 
-`auto` also falls back between the surfaces, and both verdicts are remembered for the client's life:
+### The Jev wire (`api="systemone"`)
+
+This surface posts the Jev wire itself and is the only one that answers every question from **one request**:
+`client.post(path="/systemone", body={state, model, questions}, cast_to=dict)`, which an `OpenAI` object
+exposes. The answer is the service's own — its `score`, `confidence`, `choice` and `legend` are read as they
+arrived rather than recomputed from a distribution (jevper's formulas agree to within 0.015, and the
+service's number is the one the caller gets) — and `usage` counts that one call. Two checks the type system
+cannot make still run: the answer's `type` must match the question's, and its distribution must carry
+*exactly* the question's own options or levels, both directions, with score levels re-keyed from JSON's text
+keys to their integer indices. `client.list_models()` reads `GET /v1/models` in the service's shape —
+`{"models": [{"name": …, "description": …, "release_date": …}]}`; an OpenAI-style `{"data": …}` answer is a
+`MalformedAnswerError`, because that list is the gateway's, not the service's. The client needs `post` (and
+`get` for the model list) — an `OpenAI` object has both, and a `ClientCapabilityError` names a missing one.
+
+The base URL is the **host**: jevper appends `/systemone`, so passing the endpoint itself doubles the path
+into a 404 from whatever serves that name. Refused by name before any request: the options the wire has no
+field for — `method` other than `auto`, `reasoning`, `examples`, `temperature`, `prompt_cache_key`, in one
+`ClientCapabilityError` naming every one you set — a noul carrying neither instructions nor criteria (the
+hosted Jev answers `400`; `noul_requires_question=False` sends one anyway for servers that read the question
+id instead — Ollaya, CLM and kev), a number or boolean where the wire takes a string, object or array (a
+state, an instruction, a noul criterion, an option description, a score level — an `InvalidQuestionError`
+naming every offender), and an empty question id. `extras` and `keep_alive` are refused on this route in the
+same words unless the client is built with `native=True`, which requires `api="systemone"` itself (refused
+with `auto`) — they belong to Ollaya's own `POST /api/decide`, whose answer is a `NativeSystemOneResponse`:
+the `routing` report (`router`, `model` — the checkpoint the router chose, while the response's own `model`
+stays the alias you asked for —, `route`, and a `reason` that is prose, never parsed), `state_truncated`,
+`done_reason`, `created_at`, the service's own nanosecond durations, and each answer's `laya` extras
+(`confidence`, `act_probability`) when `extras` asked for them. A `routing` that is not an object — a
+gateway answering this path with its own body — is a `MalformedAnswerError`.
+
+`auto` also falls back between the surfaces, and every verdict is remembered for the client's life:
 
 - A **404 is a missing route** unless it says the model does not exist — which it may do in the *code* rather
   than the message: `model_not_found`, `model_not_exist`, `model_does_not_exist`, `unknown_model`,
@@ -176,12 +218,19 @@ constraint says. Sum-to-one stays client-side: JSON Schema cannot express it.
   `not exist`, and a message that merely repeats the model name is not enough (`ollama` and `vLLM` answer a
   bad model id that way). A 404 that arrives *inside* a `200` body never counts: that is
   `ProviderError.embedded`, a failure the provider put in the body, and only the status line can say a route
-  is missing. The call is then re-asked on another surface, walking all three in order (Responses, Chat
-  Completions, Messages) and skipping the ones already known to be missing. An explicit `api="responses"`
+  is missing. The call is then re-asked on another surface, walking the prompt surfaces in order (Responses,
+  Chat Completions, Messages) and skipping the ones already known to be missing. An explicit `api="responses"`
   never falls back, and a pinned `method="logprobs"` never moves to Messages, which has no logprobs to carry.
   The remembered verdict only ever *skips* a route, and only where the client can speak another: a client
   whose only surface is `messages` stays on it, pays the 404 again, and reports it as a `ProviderError` with
   `status_code=404` on every call — the same error the call that learned the verdict raised.
+- A **refusal that names the protocol or the route** is the same verdict from a different status: a `400`,
+  `404`, `405`, `415` or `422` whose message carries `Model does not support this protocol.`,
+  `ModelProtocolUnsupported`, `unsupported endpoint` (case-folded, punctuation-stripped) moves the surface
+  too, and is checked before the model markers because such a refusal names the model as well. It is
+  remembered like any other, and where no prompt surface is left the `ProviderError` reports status `404`
+  whatever the refusal's own status was. A pinned `api=` rotates nothing: the provider's own error travels
+  back, and only `auto` moves.
 - A **surface that answers without a distribution** falls back for that question and is left behind for that
   model once a second answer confirms it — ollama's Responses route returns an empty logprob list,
   llama.cpp's refuses the fields, OpenRouter's refuses the logprob includable outright — so later calls start
@@ -214,6 +263,73 @@ must not be obeyed. A state cannot close its own wrapper and carry on as prompt 
 conversation and keeps its roles; a list of anything else (`[1, 2]`, `["a", "b"]`) is content and is quoted
 like any other value, while an empty list is refused. This is prompt hardening, not a sandbox — a model can
 still be persuaded.
+
+## Decisions API
+
+`client.decisions.create(*, input, questions, examples=(), model=None, method=None, api=None, reasoning=None,
+temperature=None, prompt_cache_key=None, extras=(), keep_alive=None) -> Decision`; the async facade awaits the
+same. It is the Jev call above under OpenAI's documented request and response names, so every option that
+reaches it reaches `system_one` unchanged, and `Decision.raw` is the `SystemOneResponse` it came from. An
+unknown keyword is a `TypeError` — there is no `safety_identifier` parameter, the one field of the wire
+request with no counterpart here.
+
+| Wire field | Carried as |
+| --- | --- |
+| `model`, `reasoning`, `temperature`, `prompt_cache_key`, `extras`, `keep_alive` | the same `system_one` option |
+| `input`, a string | `state`, that string |
+| `input`, user messages | `state`, the messages collapsed to `{"role": "user", "content": …}` turns (a part list is joined with newlines) |
+| `questions[].name` | the answer's `name`; jevper's ids here are positional, so two unnamed or two identically named questions stay distinct |
+| `predicate` | `Noul(instructions=…)` |
+| `choice` | `Choice(instructions=…, criteria={value: description})` |
+| `choices[].value`, a string or a boolean | the option key (`"true"`/`"false"` for booleans) and the value echoed back on the answer |
+| `score` | `Score(instructions=…, criteria=["<label>: <description>", …])` |
+
+Limits and refusals, all before any request: `questions` must hold 1..200 entries (`questions must carry
+1..200 questions, got N`); a `choice` needs 2–255 `choices` and a `score` 2–10 `levels` (the schema's own
+bounds); an option value that is neither a string nor a boolean is refused by name (`must be a string or a
+boolean, got int 1`) rather than coerced, and two values that would collapse onto one key are refused
+(`question 0: choices carry both 'true' and True, which jevper cannot tell apart — its option keys are text,
+so those two would be one option; give them distinct values`); `input` must be a string or a non-empty list
+of user messages (`input must be a string or a list of user messages, got memoryview`); and an `input_image`
+part is refused (`input message 0: input_image parts are not supported — … an image would be evidence the
+model never saw`), because the text surfaces answer from text.
+
+Answers come back in ask order, each `name` null when the question carried none:
+
+- `predicate` (`DecisionPredicateAnswer`) — `probability`;
+- `choice` (`DecisionChoiceAnswer`) — `choice`, the option's own value; `probabilities`, one `{value,
+  probability}` per option, values typed as the caller wrote them; and `confidence`;
+- `score` (`DecisionScoreAnswer`) — `score`, the probability-weighted level index; `probabilities`, one
+  `{value: index, label, probability}` per level; and `confidence`;
+- `refusal` (`DecisionRefusalAnswer`) — `type` and `name`, which jevper never emits: a refusal it meets
+  raises `ModelRefusalError`. The type exists so a payload from the endpoint itself still validates.
+
+Every probability and confidence is checked finite, and a confidence is **not** clamped to `[0, 1]`: on
+these surfaces it can be the service's own number rather than jevper's. `decision.usage` (`DecisionUsage`)
+holds `input_tokens`, `input_tokens_details{cached_tokens, cache_write_tokens}`, `output_tokens`,
+`output_tokens_details{reasoning_tokens}` and `total_tokens`: a count the provider omitted is `None`, not
+`0`, `total_tokens` is `None` unless both halves are known, and `cache_write_tokens` is always `None`,
+because no surface jevper speaks reports a cache-write counter. On a prompt surface these are the sums over
+the per-question calls; on `api="systemone"` they are the one call's own numbers.
+
+`model_dump()` holds exactly `model`, `answers` and `usage` — the shape the endpoint itself returns — while
+`decision.raw` carries what the wire has no room for: `system_one`'s `reasoning` and `debug`, and each
+answer's `laya` extras. A `system_one` response converts with `response.to_decision()`: names are the
+question ids it was asked with, a choice's values the option keys, a score's labels the `legend` texts (the
+level index when the legend has no text for it), and a response assembled by hand that is missing one of its
+own keys is a `MalformedAnswerError` naming it rather than a `KeyError` escaping the conversion.
+
+`examples` follows `system_one`'s three levels, but a mapping is keyed by question **name** here, because
+the ids are positional: an unmatched name (`examples is keyed by question name; no question is named 'x'`)
+or a name two questions share (`… the name 'x' names more than one question; pass a sequence of Example
+objects instead…`) is an `InvalidQuestionError`, and a call-level sequence outranks any id-keyed mapping,
+exactly as on `system_one`. A client built with `examples={"intent": […]}` is re-keyed to this call's ids by
+name, so a house default still guides a question named `intent`.
+
+The models: `Decision`, `DecisionPredicateAnswer`, `DecisionChoiceAnswer`, `DecisionScoreAnswer`,
+`DecisionRefusalAnswer`, `DecisionChoiceProbability`, `DecisionScoreProbability`, `DecisionUsage`,
+`DecisionInputTokensDetails`, `DecisionOutputTokensDetails`, and `Decisions`/`AsyncDecisions`, reached as
+`client.decisions`.
 
 ## Prompt caching
 
@@ -310,7 +426,9 @@ verified against MLflow 3.16.1, is the library's `docs/mlflow.md`; the extra is
 | Option | Default | Change it when |
 | --- | --- | --- |
 | `method` | `"auto"` | you have a reason (see SKILL.md) |
-| `api` | `"auto"` (prefers Responses, then Chat Completions, then Messages) | a client exposes several surfaces and you want a specific one |
+| `api` | `"auto"` (prefers Responses, then Chat Completions, then Messages; `systemone` is never chosen by `auto`) | a client exposes several surfaces and you want a specific one |
+| `native` | `False` | post to Ollaya's native `POST /api/decide` instead of `/v1/systemone`, and read its `routing` report, its own timings and each answer's `laya` extras. Requires `api="systemone"` — refused with `auto` — and it is what makes the per-call `extras`/`keep_alive` legal, since the TypeSafe route has no field for either |
+| `noul_requires_question` | `True` | `False` sends a noul carrying neither `instructions` nor `criteria`, which the System One wire format otherwise requires — for servers that read the question id instead (Ollaya, CLM, kev) |
 | `top_logprobs` | `20` | an integer in `[0, 20]`, enforced locally for every method; lower it only if the provider rejects the field. A pinned `logprobs`/`grammar` needs at least 2, since one logprob is not a distribution. A provider whose cap is lower refuses the *value* (`Invalid 'top_logprobs': integer must be between 0 and 5`), which falls back for that question without writing logprobs off for good |
 | `structured_outputs` | `True` | `False` sends `{"type": "json_object"}` instead of a strict schema on Chat Completions and Responses, and the schema then travels in the system prompt — for providers that reject strict schemas; a server that refuses the format field outright then skips that rung and is re-asked without one. The Messages route has no softer shape to send: the field is simply not sent there and the prompt carries the schema either way |
 | `prompt_cache_key` | `None` (derived per question) | route one rubric's calls to a reusable cache; non-blank, at most 256 characters. It is a routing label, not an isolation boundary — for tenants sharing a server use the provider's own control (`extra_body={"cache_salt": ...}`, below) |
@@ -325,7 +443,11 @@ Constructor misuse (unknown `method`/`api`, a count option that is not an intege
 over-long `prompt_cache_key`, a `model` that is not a non-blank string, a header name or value the HTTP layer
 could not carry) raises `JevperError` immediately, so a typo never reaches a provider — and so does a
 per-call `api=""`/`method=""` or `model=""`,
-since an override is only used when it is not `None`. A question type is checked *twice* — where it is built
+since an override is only used when it is not `None`. The `systemone` route checks its own two call arguments
+the same way: `extras` must be a sequence of names (a bare string is a `JevperError`), and `extras` or
+`keep_alive` without `native=True` — including when they arrive through `extra_body` — is a
+`ClientCapabilityError`, because the route the wrapper posts to has no field for either; the same applies to
+`native=True` with `api="auto"`. A question type is checked *twice* — where it is built
 and again in `system_one` — and both paths raise `InvalidQuestionError` (a `JevperError`), naming the field
 that was wrong: `Choice: weight: Extra inputs are not permitted`, or with an id,
 `question 'intent' is invalid: Choice: bogus: Extra inputs are not permitted`. `ReasoningConfig` is a plain

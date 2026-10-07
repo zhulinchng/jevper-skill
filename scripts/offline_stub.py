@@ -73,28 +73,45 @@ Scenarios:
     score_decimal          a discrete score written as an integral decimal string
     unicode_label          a discrete choice where ASCII folding must not absorb a Unicode lookalike
     redacted_header        a credential header kept by name but removed from recorded values and errors
+    reject_protocol      a gateway that refuses a whole protocol for this model ("Model does not support
+                         this protocol.") and answers the same question on the other OpenAI surface:
+                         ``auto`` moves and remembers the verdict, a pinned ``api`` reports the refusal
+    systemone            a Jev decision service: one request carries every question, and the service's own
+                         score, confidence, choice and legend are the answer rather than jevper's reading
+                         of a distribution. On the native route (``/api/decide``) it also reports
+                         ``routing``, ``state_truncated`` and its own timings, and answers carry a ``laya``
+                         extras block when the request asked for one
+    systemone_bad_routing  the native route answering with a ``routing`` report that is not an object
 
-It needs jevper 0.7.4 or newer. The self-test also exercises construction-path refusals, example
-validation and a state too deep for this interpreter's JSON encoder.
+It needs jevper 0.7.12 or newer. The self-test also exercises construction-path refusals, example
+validation, a state too deep for this interpreter's JSON encoder, the Decisions wrapper's request
+mapping and answer shapes, and the Jev wire's own refusals.
 
-Knobs: ``surface`` (``chat_completions``, ``responses``, ``messages`` or ``both``, default ``both`` — the
-endpoints this client exposes, as ``openai.OpenAI`` exposes the first two and ``anthropic.Anthropic`` the
-third), ``winner`` (index into the label alphabet of the option the stub prefers), ``alternatives`` (labels
+Knobs: ``surface`` (``chat_completions``, ``responses``, ``messages``, ``systemone``, ``both`` or ``all``,
+default ``both`` — the endpoints this client exposes, as ``openai.OpenAI`` exposes the first two,
+``anthropic.Anthropic`` the third, and a Jev decision service the last: ``post(path, body=...,
+cast_to=dict)`` plus ``get`` for the model list. ``all`` exposes everything), ``winner``
+(index into the label alphabet of the option the stub prefers), ``alternatives`` (labels
 reported alongside the answer; 1 means "no distribution"), ``cached_tokens`` (what the server reports as
 read from its prompt cache; ``None`` models a server that says nothing about it), ``self_reported`` (the
 probabilities a model states itself, replacing the stub's own distribution — a model whose JSON does not add
 up to 1, which is what ``normalize_probabilities=False`` hands back verbatim), ``reject_status`` and
 ``retry_headers`` (the status and response headers on the ``transient`` scenario's first refusal, the way
-the SDKs surface them, so the retry rules can be exercised without a clock). ``requests`` records what
+the SDKs surface them, so the retry rules can be exercised without a clock), ``drop_option`` (leave one
+option out of the Jev service's own distribution, which the wire requires it to carry in full — the shape
+``parse_answer`` refuses in both directions). ``requests`` records what
 each call put on the wire — the kwargs with ``extra_body`` merged in, as the SDK merges it, with
-credential header values replaced by ``<redacted>`` for safe inspection — and ``surfaces`` the endpoint
+credential header values replaced by ``<redacted>`` for safe inspection, and ``{"path", "body"}`` for a
+System One request — and ``surfaces`` the endpoint
 each one went to, in the same order.
 
 Self-test with ``python offline_stub.py --check``; probe a real provider with
-``python offline_stub.py --live --model <id>`` (add ``--extra-body '{...}'`` for request fields, e.g. the
+``python offline_stub.py --live --model <id>`` (add ``--api messages`` for an Anthropic-compatible server,
+``--api systemone`` for a Jev-wire decision service, ``--extra-body '{...}'`` for request fields, e.g. the
 ``chat_template_kwargs`` that turns thinking off on a local server). The live probe first asks the server
 what the model advertises — OpenRouter's ``/models`` and ``/models/<id>/endpoints`` cost no quota, and a
-local server usually publishes nothing — and then makes one ``system_one`` call, which on a dual-surface
+local server usually publishes nothing, while ``--api systemone`` skips that step because a decision
+service publishes no capability metadata — and then makes one ``system_one`` call, which on a dual-surface
 client can be up to three requests as ``auto`` discovers the readout. A quota, credit or key failure is
 reported as what it is rather than as a jevper failure, on stderr, so stdout is the JSON report or nothing.
 """
@@ -151,8 +168,11 @@ SCENARIOS = (
     "score_decimal",
     "unicode_label",
     "redacted_header",
+    "reject_protocol",
+    "systemone",
+    "systemone_bad_routing",
 )
-SURFACES = ("chat_completions", "responses", "messages", "both")
+SURFACES = ("chat_completions", "responses", "messages", "systemone", "both", "all")
 
 LABELS = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")  # jevper's single-letter label alphabet
 ANSWER_LOGPROB = -0.1  # the sampled label; alternatives trail it, so the softmax is decisive
@@ -164,6 +184,19 @@ SCHEMA_MARKER = "JSON Schema:\n"  # jevper puts the schema in the prompt when th
 PROMPT_TOKENS = 2388  # the measured prompt in jevper's docs/local-servers.md
 COMPLETION_TOKENS = 8
 CACHED_TOKENS = 1010  # llama.cpp's reuse for a state-varied second call on that prompt
+
+# What a Jev decision service reports. The numbers are the service's own and deliberately not the ones
+# jevper's formulas would produce from the distribution beside them (0.55 for this peak, 0.9 for this
+# expected value), so a check can tell "read as sent" from "recomputed here".
+SYSTEMONE_INPUT_TOKENS = 40
+SYSTEMONE_OUTPUT_TOKENS = 12
+SYSTEMONE_PEAK = 0.7
+SYSTEMONE_CONFIDENCE = 0.61
+SYSTEMONE_SCORE = 1.25
+SYSTEMONE_NOUL = 0.71
+SYSTEMONE_LAYA = 0.6149  # ollaya's own head, against TypeSafe's 0.8496 on the docs' example
+SYSTEMONE_ROUTING_MODEL = "stub-checkpoint"
+SYSTEMONE_EVAL_DURATION = 21_954_691  # nanoseconds, as the native endpoint reports them
 
 
 def _nested(depth: int) -> list[Any]:
@@ -417,6 +450,28 @@ class _Namespace:
         self.__dict__.update(children)
 
 
+class _SystemOneEndpoint:
+    """The two low-level methods a Jev-wire surface is reached through.
+
+    An ``openai.OpenAI`` object exposes both — ``post(path, body=..., cast_to=...)`` for the request and
+    ``get(path, cast_to=...)`` for the model list — and jevper reaches the System One surface through
+    those rather than through a typed method, so a stub that answers them is a decision service as far as
+    the library can tell. ``cast_to`` is what the caller asked for, and a real client returns the parsed
+    body for ``dict``, which is what these do.
+    """
+
+    def __init__(self, stub: StubClient) -> None:
+        self._stub = stub
+
+    def post(
+        self, *, path: str | None = None, body: Any = None, cast_to: Any = None, **kwargs: Any
+    ) -> Any:
+        return self._stub.systemone_reply(path, body)
+
+    def get(self, *, path: str | None = None, cast_to: Any = None, **kwargs: Any) -> Any:
+        return self._stub.models_reply()
+
+
 class StubClient:
     """A duck-typed client that answers jevper from canned bodies and records every request."""
 
@@ -431,6 +486,7 @@ class StubClient:
         reject_status: int = 503,
         retry_headers: dict[str, str] | None = None,
         self_reported: dict[str, float] | None = None,
+        drop_option: bool = False,
     ) -> None:
         if scenario not in SCENARIOS:
             raise ValueError(f"scenario must be one of {SCENARIOS}, got {scenario!r}")
@@ -444,15 +500,22 @@ class StubClient:
         self.self_reported = self_reported
         self.reject_status = reject_status
         self.retry_headers = retry_headers
+        self.drop_option = drop_option
         self.requests: list[dict[str, Any]] = []
         self.surfaces: list[str] = []
-        if surface in ("chat_completions", "both"):
+        if surface in ("chat_completions", "both", "all"):
             self.chat = _Namespace(completions=_Endpoint(self, "chat_completions"))
-        if surface in ("responses", "both"):
+        if surface in ("responses", "both", "all"):
             self.responses = _Endpoint(self, "responses")
-        if surface == "messages":
+        if surface in ("messages", "all"):
             # What ``anthropic.Anthropic`` exposes, and nothing else: this client has no logprob surface.
             self.messages = _Endpoint(self, "messages")
+        if surface in ("systemone", "all"):
+            # What ``openai.OpenAI`` exposes for the Jev wire — and only a client that has them can
+            # speak that surface, which is the capability check jevper makes.
+            endpoint = _SystemOneEndpoint(self)
+            self.post = endpoint.post
+            self.get = endpoint.get
 
     # -- internals ---------------------------------------------------------------------------------
 
@@ -530,6 +593,14 @@ class StubClient:
             # A server that never implemented Anthropic's route. With a Messages-only client there is
             # nowhere to move, so this is the 404 jevper must keep reporting, call after call.
             raise Rejection("Not Found", status_code=404)
+        if self.scenario == "reject_protocol" and surface == "responses":
+            # A gateway that speaks one protocol for this model and refuses the other — opencode Zen's
+            # mirror image is Chat refused, Responses answering, and both are one verdict. The message
+            # names the model and the protocol, as the real one does, so it must not read as a bad model.
+            raise Rejection(
+                "Model does not support this protocol. Use /v1/chat/completions for stub-model.",
+                status_code=400,
+            )
 
         if self.scenario == "transient" and len(self.requests) == 1:
             # The first attempt fails in a way the retry rules decide about; the second answers. The
@@ -685,7 +756,7 @@ class StubClient:
                 return body(kwargs, text="B. billing", entries=entries, cached=self.cached_tokens)
             if self.scenario in (
                 "logprobs", "reasoning", "no_responses_route", "reject_include",
-                "reject_reasoning_include", "redacted_header",
+                "reject_reasoning_include", "redacted_header", "reject_protocol",
             ):
                 return body(kwargs, entries=self._entries(kwargs), cached=self.cached_tokens)
             return body(kwargs, entries=[], cached=self.cached_tokens)  # no logprobs to give back
@@ -701,6 +772,105 @@ class StubClient:
                 answer = {**answer, "probabilities": dict(self.self_reported)}
             return body(kwargs, body=answer, cached=self.cached_tokens)
         return body(kwargs, text="A", cached=self.cached_tokens)  # a request jevper reads no answer out of
+
+    # -- the Jev wire -------------------------------------------------------------------------------
+
+    def systemone_reply(self, path: str | None, body: Any) -> dict[str, Any]:
+        """One System One request: every question answered, from that one request.
+
+        What the service returns is the answer — its own ``score``, ``confidence``, ``choice`` and
+        ``legend``, never a distribution for jevper to read — and the usage of the one call. Posted to
+        the native route it adds the report that route is for; the fields are read back by type, so a
+        field left out keeps the response type's own default rather than being invented here.
+        """
+        self.requests.append({"path": path, "body": body})
+        self.surfaces.append("systemone")
+        questions = body.get("questions") if isinstance(body, dict) else None
+        if not isinstance(questions, dict) or not questions:
+            # The service's own first refusal: an empty question map is a 422 from its request model.
+            raise Rejection("Question key cannot be empty.", 422)
+        answers = {str(key): self._systemone_answer(question) for key, question in questions.items()}
+        payload: dict[str, Any] = {
+            "model": (body.get("model") if isinstance(body.get("model"), str) else None) or "stub-model",
+            "answers": answers,
+            "usage": {"input_tokens": SYSTEMONE_INPUT_TOKENS, "output_tokens": SYSTEMONE_OUTPUT_TOKENS},
+        }
+        if isinstance(path, str) and path.endswith("/api/decide"):
+            routing: Any = {
+                "router": "stub-router",
+                "model": SYSTEMONE_ROUTING_MODEL,
+                "route": "english",
+                "reason": "The state is English prose.",
+            }
+            if self.scenario == "systemone_bad_routing":
+                routing = "the router's report, as a string"
+            payload.update(
+                {
+                    "routing": routing,
+                    "state_truncated": False,
+                    "done_reason": "decide",
+                    "created_at": "2026-09-27T00:00:00Z",
+                    "total_duration": SYSTEMONE_EVAL_DURATION + 1,
+                    "load_duration": 1,
+                    "eval_duration": SYSTEMONE_EVAL_DURATION,
+                }
+            )
+            if "laya" in (body.get("extras") or ()):
+                # Asked for by name, so the service adds it to every answer — a head of its own, with
+                # `act_probability` absent for a model that has no act head.
+                for answer in answers.values():
+                    answer["laya"] = {"confidence": SYSTEMONE_LAYA, "act_probability": None}
+        return payload
+
+    def models_reply(self) -> dict[str, Any]:
+        """``GET /models`` in the service's own shape — the one ``list_models()`` reads."""
+        self.requests.append({"path": "/models", "body": None})
+        self.surfaces.append("systemone")
+        return {
+            "models": [
+                {"name": "stub-model", "description": "the stub's own", "release_date": "2026-09-27"}
+            ]
+        }
+
+    def _systemone_answer(self, question: Any) -> dict[str, Any]:
+        """One question answered the way a decision service answers it, with its own numbers."""
+        kind = question.get("type") if isinstance(question, dict) else None
+        if kind == "noul":
+            return {"type": "noul", "noul": SYSTEMONE_NOUL}
+        criteria = question.get("criteria") if isinstance(question, dict) else None
+        if kind == "choice":
+            keys = list(criteria) if isinstance(criteria, dict) else []
+            if self.drop_option and len(keys) > 1:
+                # A distribution short of an option is no longer the distribution the question was
+                # asked for, and both directions are checked by the reader.
+                keys = keys[:-1]
+            if not keys:
+                raise Rejection("Dictionary should have at least 1 item", 422)
+            winner = keys[self.winner % len(keys)]
+            others = (1.0 - SYSTEMONE_PEAK) / max(1, len(keys) - 1)
+            return {
+                "type": "choice",
+                "choice": winner,
+                "probabilities": {key: (SYSTEMONE_PEAK if key == winner else others) for key in keys},
+                "confidence": SYSTEMONE_CONFIDENCE,
+            }
+        if kind == "score":
+            levels = list(criteria) if isinstance(criteria, list) else []
+            if not levels:
+                raise Rejection("Dictionary should have at least 1 item", 422)
+            winner = self.winner % len(levels)
+            others = (1.0 - SYSTEMONE_PEAK) / max(1, len(levels) - 1)
+            return {
+                "type": "score",
+                "score": SYSTEMONE_SCORE,
+                "legend": {str(index): text for index, text in enumerate(levels)},
+                "probabilities": {
+                    str(index): (SYSTEMONE_PEAK if index == winner else others)
+                    for index in range(len(levels))
+                },
+                "confidence": SYSTEMONE_CONFIDENCE,
+            }
+        raise Rejection(f"unknown question type {kind!r}", 422)
 
     def _probe_schema(self) -> dict[str, Any] | None:
         """The schema jevper last sent, read back off the recorded request it answered with."""
@@ -718,6 +888,7 @@ def _run_checks() -> int:
     import jevper
     from jevper import (
         Choice,
+        ClientCapabilityError,
         Example,
         IncompleteAnswerError,
         InvalidQuestionError,
@@ -725,6 +896,7 @@ def _run_checks() -> int:
         LabelReadoutError,
         MalformedAnswerError,
         ModelRefusalError,
+        NativeSystemOneResponse,
         Noul,
         ProviderError,
         ReasoningConfig,
@@ -2161,6 +2333,288 @@ def _run_checks() -> int:
     else:  # pragma: no cover
         check("redacted_header: a provider error quoting the credential is scrubbed", False, "no error")
 
+    # -- the Decisions API, over a prompt surface ---------------------------------------------------
+
+    decided = StubClient(scenario="logprobs", winner=1)
+    decisions = SystemOneClient(decided, model="stub-model").decisions
+    decision = decisions.create(
+        input="I was charged twice for the same subscription this month.",
+        questions=[
+            {"type": "predicate", "name": "refund", "instructions": "Is a refund being asked for?"},
+            {
+                "type": "choice",
+                "name": "department",
+                "instructions": "Which department should handle this complaint?",
+                "choices": [
+                    {"value": "billing", "description": "Payments, invoices, and refunds."},
+                    {"value": True, "description": "Every other case."},
+                ],
+            },
+            {"type": "score", "name": "urgency", "instructions": "How urgent is this?",
+             "levels": [{"label": "calm"}, {"label": "furious"}]},
+        ],
+    )
+    check("decisions: answers come back in ask order, each echoing its question's name",
+          [answer.name for answer in decision.answers] == ["refund", "department", "urgency"],
+          str([answer.name for answer in decision.answers]))
+    check("decisions: the answer kinds are the wire's own",
+          [answer.type for answer in decision.answers] == ["predicate", "choice", "score"],
+          str([answer.type for answer in decision.answers]))
+    chosen = decision.answers[1]
+    check("decisions: a boolean option's own value comes back as the choice",
+          chosen.choice is True, repr(chosen.choice))
+    check("decisions: a choice distribution keeps the caller's own option values",
+          sorted((probability.value for probability in chosen.probabilities), key=repr)
+          == sorted(["billing", True], key=repr),
+          str([probability.value for probability in chosen.probabilities]))
+    check("decisions: a score answer carries each level's index, its label and its probability",
+          [(probability.value, probability.label) for probability in decision.answers[2].probabilities]
+          == [(0, "calm"), (1, "furious")],
+          str(decision.answers[2].probabilities))
+    check("decisions: a dump carries exactly model, answers and usage",
+          set(decision.model_dump()) == {"model", "answers", "usage"},
+          str(sorted(decision.model_dump())))
+    check("decisions: usage is summed over the per-question calls",
+          decision.usage.input_tokens == 3 * PROMPT_TOKENS
+          and decision.usage.total_tokens == 3 * (PROMPT_TOKENS + COMPLETION_TOKENS)
+          and decision.raw.usage.n_calls == 3,
+          f"input={decision.usage.input_tokens}, total={decision.usage.total_tokens}, "
+          f"n_calls={decision.raw.usage.n_calls}")
+
+    image = StubClient(scenario="logprobs")
+    image_client = SystemOneClient(image, model="stub-model")
+    try:
+        image_client.decisions.create(
+            input=[{"role": "user", "content": [
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+            ]}],
+            questions=[{"type": "predicate", "instructions": "Is this a receipt?"}],
+        )
+        check("decisions: an input_image part is refused before any request", False, "no error")
+    except JevperError as exc:
+        check("decisions: an input_image part is refused before any request",
+              "input_image" in str(exc) and not image.requests, str(exc))
+
+    collapsed = StubClient(scenario="logprobs")
+    collapsed_client = SystemOneClient(collapsed, model="stub-model")
+    try:
+        collapsed_client.decisions.create(
+            input=state,
+            questions=[
+                {"type": "choice", "instructions": "Which one?",
+                 "choices": [{"value": True}, {"value": "true"}]},
+            ],
+        )
+        check("decisions: option values that would collapse onto one key are refused",
+              False, "no error")
+    except InvalidQuestionError as exc:
+        check("decisions: option values that would collapse onto one key are refused",
+              "cannot tell apart" in str(exc) and "distinct values" in str(exc)
+              and not collapsed.requests,
+              str(exc))
+
+    many = StubClient(scenario="logprobs")
+    many_client = SystemOneClient(many, model="stub-model")
+    try:
+        many_client.decisions.create(
+            input=state, questions=[{"type": "predicate", "instructions": "x"}] * 201
+        )
+        check("decisions: more than 200 questions is refused before any request", False, "no error")
+    except InvalidQuestionError as exc:
+        check("decisions: more than 200 questions is refused before any request",
+              "1..200" in str(exc) and not many.requests, str(exc))
+
+    named = StubClient(scenario="structured")
+    named_client = SystemOneClient(named, model="stub-model")
+    named_client.decisions.create(
+        input=state,
+        questions=[{"type": "predicate", "name": "intent", "instructions": "Is this about money?"}],
+        examples={"intent": [Example(state="a double charge", answer=True)]},
+    )
+    check("decisions: examples are keyed by question name and reach the prompt",
+          "a double charge" in json.dumps(named.requests), "")
+    try:
+        named_client.decisions.create(
+            input=state,
+            questions=[{"type": "predicate", "name": "intent", "instructions": "Is this about money?"}],
+            examples={"nope": [Example(state="x", answer=True)]},
+        )
+        check("decisions: an examples key that names no question is refused", False, "no error")
+    except InvalidQuestionError as exc:
+        check("decisions: an examples key that names no question is refused",
+              "no question is named" in str(exc), str(exc))
+
+    plain = StubClient(scenario="logprobs", winner=0)
+    converted = SystemOneClient(plain, model="stub-model").system_one(
+        state=state, questions={"intent": question()}
+    ).to_decision()
+    check("decisions: to_decision echoes the question id and the option key it was asked with",
+          converted.answers[0].name == "intent" and converted.answers[0].choice == "billing",
+          str(converted.answers[0]))
+
+    # -- the Jev wire, Decisions API and all ---------------------------------------------------------
+
+    wire = StubClient(scenario="systemone", surface="systemone")
+    wire_client = SystemOneClient(wire, model="stub-model", api="systemone")
+    wire_decision = wire_client.decisions.create(
+        input=state,
+        questions=[
+            {"type": "predicate", "name": "refund", "instructions": "Is a refund being asked for?"},
+            {"type": "choice", "name": "department", "instructions": "Which department?",
+             "choices": [{"value": "billing", "description": "money"}, {"value": True}]},
+            {"type": "score", "name": "urgency", "instructions": "How urgent is this?",
+             "levels": [{"label": "calm"}, {"label": "furious"}]},
+        ],
+    )
+    check("decisions over systemone: one request answers every question",
+          len(wire.requests) == 1 and wire_decision.raw.usage.n_calls == 1,
+          f"requests={len(wire.requests)}, n_calls={wire_decision.raw.usage.n_calls}")
+    check("decisions over systemone: the service's own numbers are the answer",
+          (wire_decision.answers[0].probability, wire_decision.answers[1].confidence,
+           wire_decision.answers[2].score)
+          == (SYSTEMONE_NOUL, SYSTEMONE_CONFIDENCE, SYSTEMONE_SCORE),
+          str([answer.model_dump() for answer in wire_decision.answers]))
+
+    auto_wire = StubClient(scenario="systemone", surface="all")
+    auto_response = SystemOneClient(auto_wire, model="stub-model").system_one(
+        state=state, questions={"intent": question()}
+    )
+    check("systemone: api='auto' never selects the Jev wire",
+          auto_response.debug["api"] != "systemone" and "systemone" not in auto_wire.surfaces,
+          f"api={auto_response.debug['api']}, surfaces={auto_wire.surfaces}")
+
+    options = StubClient(scenario="systemone", surface="systemone")
+    try:
+        SystemOneClient(options, model="stub-model", api="systemone", method="logprobs").system_one(
+            state=state, questions={"intent": question()}
+        )
+        check("systemone: an option the wire has no field for is refused by name", False, "no error")
+    except ClientCapabilityError as exc:
+        check("systemone: an option the wire has no field for is refused by name",
+              "cannot carry method='logprobs'" in str(exc) and not options.requests, str(exc))
+
+    bare = StubClient(scenario="systemone", surface="systemone")
+    try:
+        SystemOneClient(bare, model="stub-model", api="systemone").system_one(
+            state=state, questions={"refund": Noul()}
+        )
+        check("systemone: a bare noul is refused unless the server reads the question id",
+              False, "no error")
+    except InvalidQuestionError as exc:
+        check("systemone: a bare noul is refused unless the server reads the question id",
+              "instructions or criteria" in str(exc) and not bare.requests, str(exc))
+    lenient = SystemOneClient(bare, model="stub-model", api="systemone", noul_requires_question=False)
+    lenient_response = lenient.system_one(state=state, questions={"refund": Noul()})
+    check("systemone: noul_requires_question=False sends the bare noul, and it is answered",
+          lenient_response.answers["refund"].noul == SYSTEMONE_NOUL,
+          repr(lenient_response.answers["refund"]))
+
+    shaped = StubClient(scenario="systemone", surface="systemone")
+    try:
+        SystemOneClient(shaped, model="stub-model", api="systemone").system_one(
+            state=state, questions={"intent": Noul(instructions=3)}
+        )
+        check("systemone: a number where the wire takes a string, object or array is refused",
+              False, "no error")
+    except InvalidQuestionError as exc:
+        check("systemone: a number where the wire takes a string, object or array is refused",
+              "the Jev API refuses" in str(exc) and not shaped.requests, str(exc))
+
+    extras = StubClient(scenario="systemone", surface="systemone")
+    try:
+        SystemOneClient(extras, model="stub-model", api="systemone").system_one(
+            state=state, questions={"intent": question()}, extras=["laya"]
+        )
+        check("systemone: extras without native=True is refused, naming what would reach it",
+              False, "no error")
+    except ClientCapabilityError as exc:
+        check("systemone: extras without native=True is refused, naming what would reach it",
+              "native=True" in str(exc) and not extras.requests, str(exc))
+
+    unrouteable = StubClient(scenario="systemone", surface="systemone")
+    try:
+        SystemOneClient(unrouteable, model="stub-model", native=True).system_one(
+            state=state, questions={"intent": question()}
+        )
+        check("systemone: native=True with api='auto' is refused (auto never picks that surface)",
+              False, "no error")
+    except ClientCapabilityError as exc:
+        check("systemone: native=True with api='auto' is refused (auto never picks that surface)",
+              "api='systemone'" in str(exc) and not unrouteable.requests, str(exc))
+
+    native = StubClient(scenario="systemone", surface="systemone")
+    native_client = SystemOneClient(native, model="laya", api="systemone", native=True)
+    native_response = native_client.system_one(
+        state=state,
+        questions={"refund": Noul(instructions="Is a refund being asked for?")},
+        extras=["laya"],
+    )
+    check("native: the request goes to the native route and gets that route's own report",
+          native.requests[-1]["path"] == "/api/decide"
+          and isinstance(native_response, NativeSystemOneResponse)
+          and native_response.routing is not None
+          and native_response.routing.model == SYSTEMONE_ROUTING_MODEL
+          and native_response.model == "laya",
+          f"path={native.requests[-1]['path']}, routing={getattr(native_response, 'routing', None)}")
+    check("native: extras reach the body, and the model's own laya confidence comes back",
+          "laya" in (native.requests[-1]["body"].get("extras") or ())
+          and native_response.answers["refund"].laya.confidence == SYSTEMONE_LAYA,
+          repr(native_response.answers["refund"]))
+    check("native: the service's own nanoseconds come back as sent",
+          native_response.eval_duration == SYSTEMONE_EVAL_DURATION, repr(native_response.eval_duration))
+
+    bad_routing = StubClient(scenario="systemone_bad_routing", surface="systemone")
+    try:
+        SystemOneClient(bad_routing, model="laya", api="systemone", native=True).system_one(
+            state=state, questions={"intent": question()}
+        )
+        check("native: a routing report that is not an object is a malformed answer", False, "no error")
+    except MalformedAnswerError as exc:
+        check("native: a routing report that is not an object is a malformed answer",
+              "routing report" in str(exc), str(exc))
+
+    short = StubClient(scenario="systemone", surface="systemone", drop_option=True)
+    try:
+        SystemOneClient(short, model="stub-model", api="systemone").system_one(
+            state=state, questions={"intent": question()}
+        )
+        check("systemone: a distribution short of an option is refused, not read", False, "no error")
+    except MalformedAnswerError as exc:
+        check("systemone: a distribution short of an option is refused, not read",
+              "must carry exactly" in str(exc), str(exc))
+
+    listing = StubClient(scenario="systemone", surface="systemone")
+    models = SystemOneClient(listing, model="stub-model", api="systemone").list_models()
+    check("systemone: list_models reads the service's own model shape",
+          [model.name for model in models] == ["stub-model"]
+          and models[0].release_date == "2026-09-27",
+          str(models))
+
+    # -- a protocol refusal, and the surface move it causes ------------------------------------------
+
+    rotated = StubClient(scenario="reject_protocol", surface="both")
+    rotated_client = SystemOneClient(rotated, model="stub-model")
+    moved = rotated_client.system_one(state=state, questions={"intent": question()})
+    check("reject_protocol: a refusal that names the protocol moves the surface for that model",
+          rotated.surfaces == ["responses", "chat_completions"]
+          and moved.debug["api"] == "chat_completions",
+          str(rotated.surfaces))
+    again = rotated_client.system_one(state=state, questions={"intent": question()})
+    check("reject_protocol: the verdict is remembered, so the next call starts where it answered",
+          len(rotated.surfaces) == 3 and rotated.surfaces[-1] == "chat_completions"
+          and again.debug["api"] == "chat_completions",
+          str(rotated.surfaces))
+    pinned = StubClient(scenario="reject_protocol", surface="responses")
+    try:
+        SystemOneClient(pinned, model="stub-model", api="responses").system_one(
+            state=state, questions={"intent": question()}
+        )
+        check("reject_protocol: a pinned api keeps the provider's own refusal", False, "no error")
+    except ProviderError as exc:
+        check("reject_protocol: a pinned api keeps the provider's own refusal",
+              exc.status_code == 400 and "does not support this protocol" in str(exc),
+              f"{exc.status_code}: {exc}")
+
     # The live probe's own reporting, exercised offline: what a model advertises, and how a failure reads.
     advertised = _capabilities({"reasoning", "max_tokens", "structured_outputs", "logprobs"})
     check("live probe: an advertised logprob field is seen before a request is spent",
@@ -2182,6 +2636,9 @@ def _run_checks() -> int:
     unread = _live_failure(MalformedAnswerError("no JSON object in the answer — reasoning only"))
     check("live probe: an answer that could not be read is told from one that never arrived",
           "HTTP" not in unread and "the provider answered" in unread, unread)
+    bare_status = _live_failure(ProviderError("Model x does not exist", status_code=400))
+    check("live probe: a status with no known remedy says nothing rather than 'None'",
+          "HTTP 400" in bare_status and "next:" not in bare_status, bare_status)
     cut = _live_failure(IncompleteAnswerError(
         "the provider ran out of output tokens before the answer was complete ('max_tokens')"))
     check("live probe: a cut-off answer is told to raise the budget, not to retry the reading",
@@ -2301,7 +2758,10 @@ def _live_failure(exc: Exception) -> str:
     if said:
         lines.append(f"  provider says: {said}")
     remedy = _live_remedy(exc, status)
-    lines.append(f"  next: {remedy}")
+    if remedy is not None:
+        # A status with no known remedy says nothing rather than "next: None": the status, the
+        # provider's own words and the attempts above are the report in that case.
+        lines.append(f"  next: {remedy}")
     return "\n".join(lines)
 
 
@@ -2339,8 +2799,10 @@ def _run_live(model: str, api: str, extra_body: dict[str, Any] | None = None) ->
         },
     )
     # Free where the server offers it: what the model advertises decides the readout before a token is spent.
+    # A Jev decision service publishes no such metadata — it is not an OpenAI-compatible model server —
+    # so that probe goes straight to the one call.
     preflight = None
-    if api != "messages":
+    if api not in ("messages", "systemone"):
         preflight = _preflight(os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1", model)
         if preflight is not None:  # to stderr, so stdout stays the JSON result
             print(f"preflight  {model}: logprobs={'yes' if preflight['logprobs'] else 'no'}, "
@@ -2378,7 +2840,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--check", action="store_true", help="run the offline self-test")
     parser.add_argument("--live", action="store_true", help="ask a real provider which method it resolves to")
     parser.add_argument("--model", default=os.environ.get("LLM_MODEL", ""), help="model id for --live")
-    parser.add_argument("--api", default="auto", choices=("auto", "chat_completions", "responses", "messages"))
+    parser.add_argument("--api", default="auto",
+                        choices=("auto", "chat_completions", "responses", "messages", "systemone"))
     parser.add_argument(
         "--extra-body", default=None, metavar="JSON",
         help='request fields merged into every call, e.g. \'{"chat_template_kwargs": '

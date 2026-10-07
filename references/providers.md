@@ -3,6 +3,7 @@
 - [Does this provider do logprobs?](#does-this-provider-do-logprobs) — the observed matrix, and the one-line probe
 - [Surfaces](#surfaces) — what each one carries, and how `api="auto"` picks
 - [Local servers](#local-servers) — what to pass, how to turn thinking off, what each server ignores
+- [Decision services](#decision-services) — the Jev wire (`api="systemone"`): the hosted service, Ollaya, CLM and kev
 - [The Messages route](#the-messages-route) — the Anthropic API: who implements it, and what it lacks
 - [Prompt-cache reporting](#prompt-cache-reporting) — who reports `cached_tokens`, and what the counts look like
 
@@ -34,6 +35,7 @@ switching models:
 ```sh
 python scripts/offline_stub.py --live --model <model-id>                  # OpenAI-compatible
 python scripts/offline_stub.py --live --model <model-id> --api messages   # Anthropic-compatible
+python scripts/offline_stub.py --live --model <model-id> --api systemone  # a Jev-wire decision service
 ```
 
 It prints the resolved method per question, the surface actually used, the readout source, `n_calls`,
@@ -70,7 +72,9 @@ honours by default — it waits as long as the server asked, which `max_delay` d
 
 `api="auto"` (the default) prefers the Responses surface, which carries native reasoning and encrypted
 content — except for `grammar`, which only Chat Completions can carry. The Messages API is the last choice
-of the three, and the only one with no label readout. A client missing the attribute the chosen surface
+of the prompt surfaces, and the only one with no label readout; `api="systemone"` is never chosen by `auto`
+at all — it is the Jev wire, a different service rather than another route of this one — so it is only ever
+pinned. A client missing the attribute the chosen surface
 needs raises `ClientCapabilityError` naming the surface to pass explicitly.
 
 | | Chat Completions | Responses | Messages |
@@ -136,6 +140,12 @@ A client object cannot say whether the *server* implements a route — `openai.O
   `model_does_not_exist`, `unknown_model`, `invalid_model`, `unsupported_model` — a body that carries
   nothing else is the only field a provider reliably fills in. `ollama` and `vLLM` answer a bad model id by
   naming it; those are reported as they stand, on either surface.
+- **A `400`, `404`, `405`, `415` or `422` that names the protocol or the route** → the same verdict as a
+  missing route: `Model does not support this protocol.`, `ModelProtocolUnsupported`, `unsupported endpoint`
+  and their punctuation/case variants move the call to another prompt surface, and are checked *before* the
+  model markers because such a refusal names the model as well. Where no prompt surface is left, the
+  `ProviderError` reports status 404 whatever the refusal's own status was. Only `auto` rotates — a pinned
+  `api=` returns the provider's own error.
 - **A surface that answers without a distribution** → left behind for that model after a second confirming
   answer (a refusal is believed at once): ollama's Responses route returns an empty logprob list, llama.cpp's
   refuses the fields and OpenRouter's refuses the includable, while Chat Completions on all three carries the
@@ -297,9 +307,129 @@ and the silent ones:
 - LM Studio's routes disagree about `reasoning_effort`: honoured on `/v1/responses`, ignored on
   `/v1/chat/completions` (#2413). `/v1/responses` also ignores `instructions` (#1154).
 
+**Re-verified on 2026-09-26**, after the System One surface landed, against the same five servers (25 or 26
+of the same 26 checks unchanged on jevper 0.7.6; vLLM, SGLang and LM Studio run twice, after a reboot).
+Three findings worth carrying:
+
+- **llama.cpp's `/v1/responses` is not usable for this wire format either way**: asked for a structured
+  `noul` it answers a label where a probability belongs — `MalformedAnswerError: 'noul' must be a finite
+  number, got 'A'` — reproduced on two different models, so it is the shim's answer rather than one model's
+  mistake. Its Chat Completions route serves the same three questions correctly.
+- **`grammar` works wherever the server's `top_logprobs` name the alternatives**: it read a real
+  distribution on ollama, vLLM, SGLang and LM Studio, and failed only on the 4B behind llama.cpp, where a
+  confident small model left the losing label out of its top 20 — a property of the model behind the server,
+  not of the server. Use `logprobs` or `structured` where the readout cannot find the alternatives.
+- **Ollama's `auto` costs what the ladder costs**: it serves `/v1/responses` but its logprob list comes back
+  empty there, so the ladder probes it and moves to Chat Completions — 6 requests for 3 questions, three
+  answers plus three probes, with the probes in `debug["llm_attempts"]` and `usage.n_calls` counting results,
+  not wire. vLLM, SGLang and LM Studio answer on Responses first, so `auto` costs them nothing.
+
+**The output budget is bounded below by the thinking and above by the context window** (measured at the end
+of 2026-09-26, jevper 0.7.8). At **512** output tokens the always-thinking Qwen3 templates truncated before
+answering on nearly every scenario — `IncompleteAnswerError` on all five, which reads like a library fault
+and is not one. At **2048** that is gone on ollama and vLLM; what remains on llama.cpp, SGLang and LM Studio
+is the thinking itself, which those templates charge to the output budget. At **4096** the same three answer
+`400 Requested token count exceeds the model's maximum context length of 4096 tokens` — they are launched
+with `--max-model-len 4096`, so a 4096-token *output* request leaves nothing for the prompt. 2048 is the
+right budget for a 4096-token window; the rule is the window's own — keep the output cap well under
+`max_model_len`, and read an `IncompleteAnswerError` naming `max_output_tokens` as "raise the budget, if the
+window allows it". On the Messages route the thinking budget is **added** to the output budget (it must sit
+strictly below `max_tokens`), so a 2048 budget on top of a 2048 output request is the whole window.
+
 The library's [local-servers.md](https://github.com/zhulinchng/jevper/blob/main/docs/local-servers.md)
 holds the full measurements: raw HTTP shapes per server, cache inspection and flush endpoints, and what
 fits a 12 GB card.
+
+## Decision services
+
+The Jev wire is `POST {base}/systemone` with `{state, model, questions}` and a `{model, answers, usage}`
+answer. Two things about it are structural, and they are the ones that cost an afternoon:
+
+- **The base URL is the host, not the endpoint.** jevper appends `/systemone` itself, so
+  `https://opencode.ai/zen/v1` is the value that belongs in `base_url`; add `/systemone` and the path
+  doubles to `/zen/v1/systemone/systemone`, which the gateway answers with a `404` **HTML page** that
+  arrives as a `ProviderError` carrying the markup.
+- **One request answers every question**, and the service evaluates each on its own — measured 11 questions
+  in one call: 1.08 s, 1094 input + 353 output tokens — where a prompt surface spends one request per
+  question. `usage` counts that one call.
+
+| Service | `base_url` | `model` | Notes |
+| --- | --- | --- | --- |
+| Hosted Jev (TypeSafe wire) | `https://api.typesafe.ai/v1`, or opencode Zen's `https://opencode.ai/zen/v1` | the deployment's own, e.g. `jev-latest` | the service's own `score`, `confidence`, `choice` and `legend` are read as they arrived, rather than recomputed from a distribution — jevper's arithmetic agrees to within 0.015, which is a reason to trust it, not to substitute it |
+| Ollaya | `http://127.0.0.1:11435/v1`; the server root for `native=True` | `laya:en` or `laya:typed-decisions`; `laya` is a router | `/v1` is declared wire-identical to TypeSafe's; `/api/decide` at the root is its own route and needs `native=True` — two depths, so two client objects for both |
+| CLM | `http://127.0.0.1:8700/v1` | `clm-latest` (or `clm-raw`) | `temperature` sharpens here instead of sampling, so jevper refuses its own `temperature=` by name; a long state is cut silently on vLLM or refused `502` on llama.cpp |
+| kev | `http://127.0.0.1:8009/v1` | `kev-latest` (calibrated) or `jev-latest` (raw) | wire-identical to TypeSafe's; install from source, because the PyPI name is another package |
+
+Error envelopes differ by deployment and all reach the caller as a `ProviderError` carrying the service's
+own words: the hosted service answers `{"error": {"type": "server_error", "message": …}}` for its `400`,
+`401` and `402` and `{"detail": …}` — a string, an object or pydantic's `422` list — for the rest; Ollaya
+reports a wrong route depth as `{"error": "/v1/api/decide not found", "code": "NOT_FOUND"}`; CLM answers a
+state past the encoder's window with a `502` carrying both token counts. A client that only parses `detail`
+misses the first three, one that only parses `error` misses the rest; jevper parses both.
+
+`GET /v1/models` is where deployments part company, which makes `list_models()` a shape check as much as a
+model list: the documented `{"models": [{"name", …}]}` shape is the service's own and what Ollaya and CLM
+serve, while opencode Zen answers the same path OpenAI-style (`{"object": "list", "data": [...]}`) and is a
+`MalformedAnswerError` naming what arrived — a gateway's list, not the decision service's. CLM's two routes
+both sit under `/v1`, so one client object reaches both; Ollaya is the one with the split — its `/v1`
+TypeSafe routes and its root-depth `POST /api/decide` are different depths, so reaching both takes two
+client objects, and `native=True` is what posts to the second. No other server here has such a route.
+
+### Ollaya
+
+Its `/v1` is wire-identical to TypeSafe's, and its native `/api/decide` takes the same body and adds a
+report on the request: `routing` (`route` is the stable key to branch on — `english` — and `routing.model`
+is the checkpoint that answered, while the response's own `model` stays the alias you asked for),
+`state_truncated`, `done_reason`, `created_at` and the service's own nanoseconds (`eval_duration` was
+21,954,691 ns on one measured call). `extras=["laya"]` adds each answer's own `laya` confidence —
+`1 − H(p)/ln K` for a choice or a score, `max(p, 1 − p)` for a noul, so a different number from TypeSafe's
+beside it (0.615 against 0.8496 on the same choice) — plus `act_probability`, `null` for a model with no act
+head; `"laya"` is a closed set, and an unknown name is the server's own `400 Input should be 'laya'`.
+`keep_alive` is Ollama's model lifecycle control in that server's units. Its limits are the answering
+model's, not jevper's — 127 options with a 4-character instruction, 126 with a 100-character one (the
+instruction spends the same budget), 255 absolute, 256 questions per request, 65,536 state tokens — and
+jevper enforces none of them, surfacing the refusals (`TOO_MANY_OPTIONS`, `INPUT_TOO_LONG`) as written.
+`noul_requires_question=False` reaches its bare-noul support; `laya:en` chose the F16 graph here, and its
+own model card warns that the top two options within 0.01 are not stable across precisions.
+
+### CLM
+
+`CLM-v0.1-8B` is a frozen Qwen3-8B encoder with two projection heads — a state head and an action head,
+trained with a bidirectional InfoNCE loss; there is no generation anywhere in it, which is where its latency
+comes from. Two things change how you call:
+
+- **`temperature` sharpens the distribution instead of sampling** — it divides the logits before the
+  softmax, within `(0, 100]` (`422 temperature must be in (0, 100]` outside it). The same field means
+  something else on a prompt surface, so jevper refuses its own `temperature=` by name here and
+  `extra_body={"temperature": 0.2}` is how you reach it.
+- **A long state is cut silently or refused loudly**, decided by the encoder behind the server rather than
+  by `clm-serve`: it sends `truncate_prompt_tokens: 2048`, which only vLLM's embedder understands, so on the
+  documented `vllm serve` path the state is genuinely cut and the service does not report that it was —
+  while llama.cpp's `/v1/embeddings` ignores the field (and its own `truncate` flag) and answers
+  `502 embedder error 400: request (5607 tokens) exceeds the available context size (2048 tokens)`. The
+  loud failure is the better one, but it costs three requests, since a `502` is a 5xx the default retry
+  policy retries: pass `RetryPolicy(n_retries=0)` for a state you know is long. Either way raise **both**
+  limits together — the encoder's `-c` and `clm-serve --max-tokens`; measured at `-c 8192 -np 1` with
+  `--max-tokens 8192`, a 5631-token state answers in one attempt.
+
+Its `usage` carries `billing_units` — the number of *questions* — beside `input_tokens` (encoder tokens
+spent on cache misses), so one request answering three questions is `n_calls == 1`, not 3; the server's own
+count stays in the recorded body at `debug["llm_attempts"][0]["response"]["usage"]`, since `debug` has no
+`usage` key. `list_models()` works here. A `CLMClient` you already hold has neither `post` nor `get`, so
+jevper's surface is reached through a small adapter over its private `_post` (the library's
+`examples/clm_transport.py`) and there is no async twin.
+
+### kev
+
+`POST /v1/systemone` and `GET /v1/models` are TypeSafe's own shapes here, so kev is reached with no special
+handling: `kev-latest` applies the fitted temperature and `jev-latest` returns raw probabilities; a choice's
+confidence is `(p_max − 1/K)/(1 − 1/K)`; score probabilities and `legend` arrive keyed by `str(level)` and
+are read back as the rubric's own integer indices; `usage` has no `billing_units`; `latency_ms` is not read;
+errors are FastAPI `{"detail": …}`, and a bare noul is accepted with `noul_requires_question=False`. **The
+PyPI name is a different package** — `pip install kev` gets K.E.V. ORM — so install from source:
+`git clone https://github.com/jaredpalmer/kev.git && cd kev`, `pip install -e ".[serve]"`, then
+`python -m kev.serve --run jaredpalmer/kev-4b --port 8009`. There is no separate native route, so
+`native=True` has nothing to post to on this server.
 
 ## The Messages route
 

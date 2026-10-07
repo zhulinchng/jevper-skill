@@ -14,7 +14,12 @@ lacks logprobs falls back for that question but is written off only after a seco
 fallback it tries the *other surface* when the client exposes one and the reasoning mode is not `native` — a
 pinned `method="logprobs"` takes that move too, keeping its method — and a 404 is read as a missing route,
 answered on the other surface where the client has one, unless it quotes the model id and says the model
-does not exist. A rejection that names a *value* rather than a field (`top_logprobs must be between 0 and
+does not exist. A `400`, `404`, `405`, `415` or `422` that names the protocol or the route
+(`Model does not support this protocol.`, `ModelProtocolUnsupported`, `unsupported endpoint`) is the same
+verdict from another status: it moves the call, it is checked before the model markers, and once no surface
+is left the `ProviderError` reports status 404 whatever the refusal's own status was. Only `auto` rotates —
+a pinned `api=` returns the provider's own error.
+A rejection that names a *value* rather than a field (`top_logprobs must be between 0 and
 20`) and a 5xx that survives its retries both fall back for that question alone, without being remembered.
 The same distinction holds on the capability ladder: only a complaint about a field's *existence* drops it
 — the schema excepted, since the prompt keeps the schema either way — and a server that refuses the number
@@ -144,6 +149,16 @@ is `None` when any constituent call omitted it — a reported `0` is preserved.
 | Costs doubled unexpectedly | `reasoning` is on with `mode="two_step"` (two calls per question) — `usage.n_calls` shows it |
 | A second call about the same rubric reports `cached_tokens` `0` or `None` | `None` means the server does not report it (vLLM and SGLang need a flag); `0` means the shared prefix was not reused — the state must stay last, and OpenAI only caches a prefix of 1024 tokens or more. A chat-list state whose last turn is the assistant's moves the question last by design (no server answers a conversation ending on an assistant turn), which costs that prefix: end the state on a user turn to keep it |
 | Wide `Choice` (>26 options) raises `InvalidQuestionError` | use `auto`, `structured` or `discrete`; `logprobs` and `grammar` read one label token |
+| `ProviderError` 404 whose body is HTML, from a Jev endpoint | the client's `base_url` includes `/systemone`, so jevper's own appended path doubled: pass the host (`https://opencode.ai/zen/v1`) and let jevper add the route |
+| `ClientCapabilityError: api='systemone' cannot carry method=…, reasoning=…, examples=…, temperature=…, prompt_cache_key=…` | the Jev wire has no such field: drop it, or ask that question on a prompt surface. CLM's sharpening temperature is reached with `extra_body={"temperature": …}`, not `temperature=` |
+| `ClientCapabilityError: native=True posts to ollaya's /api/decide …` | build with `api="systemone"` — `native=True` is only refused with `auto`. The reverse (`… cannot carry extras/keep_alive; those belong to ollaya's native endpoint`, including when they arrive through `extra_body`) means either build with `native=True` or drop both on the TypeSafe route |
+| `InvalidQuestionError: the Jev API refuses …` (a number where the wire takes a string, object or array; an empty question id) | the check names every offender: a state, an instruction, a noul criterion, an option description and a score level are all JSON values, and a question id cannot be empty. A bare noul is its own case: the hosted service answers `400 Noul question must have criteria or instructions`, and `noul_requires_question=False` sends one anyway only to servers that read the question id instead — Ollaya, CLM and kev |
+| `MalformedAnswerError: the service's choice distribution must carry exactly this question's options …` (or the same for a score's levels) | the service answered a rubric other than the one asked — a stale deployment, or `model` pointing at a model that answers the wrong question set. It is refused in both directions rather than read, so fix the deployment rather than the caller |
+| `MalformedAnswerError: the model list must be an object with a 'models' array` | whatever answered `GET /v1/models` serves its own OpenAI-style list (`{"object": "list", "data": [...]}` — opencode Zen does): that list is the gateway's, not the decision service's. Point `list_models()` at the service's own base URL, or skip it there |
+| `400 {"error": {"type": "server_error", "message": "… Model is unavailable."}}` from a hosted Jev service | the account or the model, not jevper: the service reports its `400`/`401`/`402` this way and its other refusals as `{"detail": …}`. `list_models()` shows what the deployment offers |
+| `ProviderError` 502 `exceed_context_size` from CLM's llama.cpp encoder | the state is past the encoder's window and the loud 502 is the good case — but a 5xx is retried three times by default, so pass `RetryPolicy(n_retries=0)` for a state you know is long, and raise **both** limits together (the encoder's `-c` and `clm-serve --max-tokens`) |
+| `JevperError: … input_image parts are not supported …` from `decisions.create` | every surface jevper speaks answers from text, so an image would be evidence the model never saw: drop the part, or send the image to a model that renders it |
+| `InvalidQuestionError: … choices carry both 'true' and True … give them distinct values` from `decisions.create` | two option values collapse onto one key, because jevper's option keys are text. Give the options distinct values. A `ModelRefusalError` from the same call is the model declining one question: rewrite it or change the model — a retry is refused the same way |
 
 One `except JevperError` covers every error jevper raises, but not construction errors from the SDK itself:
 with **both** `method="logprobs"` and `api` pinned there is no `auto` path left to interpret a provider's
